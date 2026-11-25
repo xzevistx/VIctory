@@ -7820,14 +7820,19 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let (op, sample) = match name {
-            "image_sample" | "image_sample_o" => (60, true),
+            // `_cl`: a floor on the level of detail, so the finest mip the
+            // sample may pick (the streaming clamp: titles keep samples off
+            // mips not loaded yet); it comes after the coordinates.
+            "image_sample" | "image_sample_o" | "image_sample_cl" | "image_sample_cl_o" => {
+                (60, true)
+            }
             "image_sample_lz" | "image_sample_l" => (62, true),
-            "image_sample_b" => (61, true),
+            "image_sample_b" | "image_sample_b_cl" => (61, true),
             "image_sample_c_lz" => (65, true),
             "image_sample_d" | "image_sample_d_cl" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
-            "image_sample_c" if self.s.pixel => (64, true),
+            "image_sample_c" | "image_sample_c_cl" if self.s.pixel => (64, true),
             "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" | "image_gather4_l"
             | "image_gather4_l_o" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
@@ -7903,8 +7908,8 @@ impl<'a> Lower<'a> {
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
-            let first =
-                usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
+            let biased = matches!(name, "image_sample_b" | "image_sample_b_cl");
+            let first = usize::from(offset_word) + usize::from(biased) + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
@@ -7985,6 +7990,15 @@ impl<'a> Lower<'a> {
             }
             let mut args = vec![h, sh];
             args.extend(&cs);
+            // The `_cl` floor of a sample with implicit or biased level, or a
+            // comparison (DXIL's clamp operand; undefined: none).
+            let clamped = matches!(op, 60 | 61 | 64) && name.split('_').any(|t| t == "cl");
+            let clamp = if clamped {
+                let x = addr_val(self, first + grads + coords)?;
+                to_float(self, x)
+            } else {
+                fu
+            };
             match op {
                 60 => {
                     if offset_word {
@@ -8007,7 +8021,7 @@ impl<'a> Lower<'a> {
                         }
                     }
                     args.extend(&os);
-                    args.push(fu);
+                    args.push(clamp);
                     self.s
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
@@ -8015,7 +8029,7 @@ impl<'a> Lower<'a> {
                     let bias = addr_val(self, 0)?;
                     let bias = to_float(self, bias);
                     args.extend(&os);
-                    args.extend([bias, fu]);
+                    args.extend([bias, clamp]);
                     self.s.op(
                         c,
                         "sampleBias.f32",
@@ -8114,7 +8128,7 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     args.push(reference);
                     let name = if op == 64 {
-                        args.push(fu);
+                        args.push(clamp);
                         "sampleCmp.f32"
                     } else {
                         "sampleCmpLevelZero.f32"

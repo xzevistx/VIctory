@@ -1408,6 +1408,107 @@ fn image_addresses_of_16_bits_and_clamps() {
     }
 }
 
+/// The streaming clamp of samples with implicit or biased level
+/// (`image_sample_cl`, `image_sample_b_cl`): the root constant, after the
+/// 32-bit coordinates, is the finest level the sample may pick. As above,
+/// a 32x32 texture whose level `n` holds `n`, sampled at level 1 by the
+/// derivatives (2 with the bias of 1) with a point sampler.
+#[test]
+fn image_samples_with_a_level_clamp() {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let (v0, v3, v4) = (vgpr(0), vgpr(3), vgpr(4));
+    // Descriptors as above: s[8:15] the levels texture (heap index 0),
+    // s[20:23] the raw UAV (1), s[16:19] the sampler.
+    let mut prefix = vec![s_mov_b32(5, 0x80), s_mov_b32(7, 0x80)];
+    for (op, dst, base, offset) in [(3u32, 8u32, 4u32, 0u32), (2, 20, 4, 0x20), (2, 16, 6, 0)] {
+        prefix.extend([
+            0x3D << 26 | op << 18 | dst << 6 | base >> 1,
+            125 << 25 | offset,
+        ]);
+    }
+    // A 2x2 quad per four lanes: u = (4 + (l & 1)) / 16, v = (4 + (l >> 1 & 1)) / 16
+    // in v3 and v4, the clamp (s0) in v5, a bias of 1 in v2.
+    prefix.push(0x1B << 25 | 3 << 17 | (v0 as u32 & 0xFF) << 9 | 129); // v_and_b32 v3, 1, v0
+    prefix.extend(vop3(0x148, 4, v0, 129, 129)); // v_bfe_u32 v4, v0, 1, 1
+    prefix.push(0x25 << 25 | 3 << 17 | (v3 as u32 & 0xFF) << 9 | 132); // v_add_nc_u32 v3, 4, v3
+    prefix.push(0x25 << 25 | 4 << 17 | (v4 as u32 & 0xFF) << 9 | 132); // v_add_nc_u32 v4, 4, v4
+    prefix.extend([vop1(0x006, 3, v3), vop1(0x006, 4, v4)]); // v_cvt_f32_u32
+    // v_mul_f32 v3, 1/16, v3; v_mul_f32 v4, 1/16, v4
+    prefix.extend([
+        0x08 << 25 | 3 << 17 | (v3 as u32 & 0xFF) << 9 | 255,
+        0x3D80_0000,
+    ]);
+    prefix.extend([
+        0x08 << 25 | 4 << 17 | (v4 as u32 & 0xFF) << 9 | 255,
+        0x3D80_0000,
+    ]);
+    prefix.push(vop1(0x001, 5, sgpr(0))); // v_mov_b32 v5, s0
+    prefix.push(vop1(0x001, 2, 242)); // v_mov_b32 v2, 1.0
+    let used = [
+        (4, ResourceType::Srv, 0, 8),
+        (4, ResourceType::Uav, 8, 4),
+        (6, ResourceType::Sampler, 0, 4),
+    ];
+    let program = |sample: [u32; 2]| {
+        let mut words = prefix.clone();
+        words.extend(sample);
+        words.extend(buffer_store_dword(6, 20, 0));
+        words.push(S_ENDPGM);
+        // Implicit derivatives in compute: not validated, as above.
+        lower_cs32(&words, &used, false)
+    };
+    // image_sample_cl v[6:9], v[3:5], s[8:15], s[16:19] dmask:0xf dim:2D
+    let clamped = program([0xF084_0F08, 3 | 6 << 8 | 2 << 16 | 4 << 21]);
+    // image_sample_b_cl v[6:9], v[2:5], s[8:15], s[16:19] dmask:0xf dim:2D
+    let biased = program([0xF098_0F08, 2 | 6 << 8 | 2 << 16 | 4 << 21]);
+
+    let samplers = [D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxAnisotropy: 1,
+        MaxLOD: f32::MAX,
+        ..Default::default()
+    }];
+    let views = [View::Levels(32, 6), View::RawUav(9)];
+    let f = |x: f32| x.to_bits();
+    let cases: [(&HostShader, u32, f32); 7] = [
+        (&clamped, f(0.0), 1.0), // the derivatives' level
+        (&clamped, f(2.0), 2.0),
+        (&clamped, f(3.0), 3.0),
+        (&clamped, f(-1.0), 1.0),
+        (&biased, f(0.0), 2.0), // the bias's level
+        (&biased, f(3.0), 3.0),
+        (&biased, f(-1.0), 2.0),
+    ];
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for (shader, k, want) in cases {
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(user_data_cs32(shader, k)))],
+                        views: &views,
+                        samplers: &samplers,
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(f32::from_bits(out[0][0]), want, "{label}: {k:#x}");
+        }
+    }
+}
+
 /// MIMG `image_atomic_<op> vdata, v[vaddr:vaddr+1], s[srsrc:srsrc+7]
 /// dmask dim:2D unorm` (glc returns the old value).
 const fn image_atomic(op: u32, vdata: u8, vaddr: u8, srsrc: u8, dmask: u32, glc: bool) -> [u32; 2] {
