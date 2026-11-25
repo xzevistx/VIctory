@@ -10,7 +10,13 @@
 //! same physical pages) in the runtime's memory; elsewhere, a content hash
 //! of the whole memory at every submission that samples it.
 //!
-//! shortcut: a change detiles the whole texture, not the pages written.
+//! A change detiles only the subresources whose bytes it touched, and
+//! tracked memory reads back only the pages written: the title streams
+//! textures in place, a mip or a few pages at a time, as the view moves
+//! (finer mips for what comes near), and detiling the whole texture for
+//! each of those writes cost frames. Subresources are grouped into parts
+//! of overlapping tiled bytes (the mip tail's block, a thick volume's
+//! slabs), each changed or not as a whole.
 //! Textures read through descriptor tables are brought up to date, and for
 //! shaders that index the heap themselves every texture with a resource
 //! object the heap views (`crate::bindless`); textures the title placed in
@@ -49,15 +55,76 @@ pub(crate) struct Staging {
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, hashed instead).
     tracked: Option<crate::watch::Tracked>,
+    /// The subresources by the tiled bytes they read ([`parts`]).
+    parts: Vec<Part>,
     last: Mutex<Last>,
+    /// Whether it was reported streamed in part (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    reported: std::sync::atomic::AtomicBool,
 }
 
-/// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not tracked), with room to read tracked memory into.
+/// Subresources (indices into the footprints) whose tiled bytes overlap,
+/// and the bytes `[from, to)` of the texture's memory they read: one
+/// changes only if those bytes do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Part {
+    from: usize,
+    to: usize,
+    subresources: Vec<u32>,
+}
+
+/// What a texture's staging buffer holds: the hash of each part's memory
+/// detiled (memory not tracked), or the memory as last read (tracked:
+/// pages not written since stay as read).
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hashes: Vec<Option<blake3::Hash>>,
     read: Vec<u8>,
+    /// `read` holds the whole memory once.
+    filled: bool,
+}
+
+/// Texture refreshes since the last frame-rate line: those that detiled,
+/// the subresources they detiled, and the subresources they left as they
+/// were (their bytes did not change). The bytes read are in
+/// `host::PREPARING`.
+pub(crate) static REFRESHES: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Groups subresources (`extents[i]`: the tiled bytes subresource `i`
+/// reads, as offsets into the texture's memory) into parts of overlapping
+/// bytes, by first byte.
+fn parts(extents: &[(usize, usize)]) -> Vec<Part> {
+    let mut order: Vec<u32> = (0..extents.len() as u32).collect();
+    order.sort_by_key(|&i| extents[i as usize]);
+    let mut parts: Vec<Part> = Vec::new();
+    for i in order {
+        let (from, to) = extents[i as usize];
+        match parts.last_mut() {
+            Some(p) if from < p.to => {
+                p.to = p.to.max(to);
+                p.subresources.push(i);
+            }
+            _ => parts.push(Part {
+                from,
+                to,
+                subresources: vec![i],
+            }),
+        }
+    }
+    parts
+}
+
+/// Which of `parts` the written byte ranges `runs` (offsets into the
+/// texture's memory) touch.
+fn touched(parts: &[Part], runs: &[(usize, usize)]) -> Vec<bool> {
+    parts
+        .iter()
+        .map(|p| runs.iter().any(|&(a, b)| a < p.to && p.from < b))
+        .collect()
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -204,7 +271,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     };
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
-    record(list, resource, texture, &staging);
+    record(list, resource, texture, &staging, None);
     // Once per submission however many of its lists sample the texture.
     list.defer_texture(staging);
 }
@@ -221,20 +288,25 @@ pub(crate) fn upload_changed(list: &HostList, resource: This, texture: &ID3D12Re
     let Some(staging) = staging(resource, texture) else {
         return false;
     };
-    if !staging.refresh() {
+    // Only the subresources that changed: the host texture keeps the rest.
+    let detiled = staging.refresh_detiled();
+    if detiled.is_empty() {
         return false;
     }
-    record(list, resource, texture, &staging);
+    record(list, resource, texture, &staging, Some(&detiled));
     list.keep(&staging.buffer);
     true
 }
 
-/// Records the copy of every subresource of `staging` into `texture`,
-/// moving it to the copy destination state first.
-fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &Staging) {
+/// Records the copy of every subresource of `staging` (or of `only`) into
+/// `texture`, moving it to the copy destination state first.
+fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &Staging, only: Option<&[u32]>) {
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
     for (i, footprint) in staging.footprints.iter().enumerate() {
+        if only.is_some_and(|only| !only.contains(&(i as u32))) {
+            continue;
+        }
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
@@ -287,33 +359,64 @@ impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all): whether it did.
     pub(crate) fn refresh(&self) -> bool {
+        !self.refresh_detiled().is_empty()
+    }
+
+    /// [`Staging::refresh`], returning the subresources detiled.
+    fn refresh_detiled(&self) -> Vec<u32> {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let (read, changed) = self.refresh_now();
+        let (read, detiled) = self.refresh_now();
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
-        changed
+        detiled
     }
 
-    /// Returns the bytes of title memory read, and whether it detiled.
-    fn refresh_now(&self) -> (usize, bool) {
+    /// Returns the bytes of title memory read, and the subresources it
+    /// detiled.
+    fn refresh_now(&self) -> (usize, Vec<u32>) {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some(t) = &self.tracked {
-            if t.take(start, start + size).is_empty() {
-                return (0, false);
+            let runs: Vec<(usize, usize)> = t
+                .take(start, start + size)
+                .into_iter()
+                .map(|(a, b)| (a - start, b - start))
+                .collect();
+            if runs.is_empty() {
+                return (0, Vec::new());
             }
             // Read through the copy, which stands unmapped pages: memory of
-            // big pools is too slow to ask page by page.
+            // big pools is too slow to ask page by page. Once the whole
+            // memory is read, only the pages written since: the others are
+            // guarded, so as they were.
+            let whole = !last.filled || last.read.len() != size;
             last.read.resize(size, 0);
-            crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&last.read);
+            let read = if whole {
+                crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
+                last.filled = true;
+                size
+            } else {
+                for &(a, b) in &runs {
+                    // SAFETY: `take` cuts the runs to the memory, so both
+                    // ranges are inside `read` and the texture's memory.
+                    let (to, from) = unsafe { (last.read.as_mut_ptr().add(a), self.memory.add(a)) };
+                    crate::host::copy_mapped(to, from, b - a, false);
+                }
+                runs.iter().map(|&(a, b)| b - a).sum()
+            };
+            let dirty = if whole {
+                vec![true; self.parts.len()]
+            } else {
+                touched(&self.parts, &runs)
+            };
+            let detiled = self.detile(&last.read, &dirty);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return (size, true);
+            crate::copystat::add(crate::copystat::C::TexWatched, read as u64);
+            return (read, detiled);
         }
         if !committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
@@ -323,52 +426,124 @@ impl Staging {
                 desc = ?self.layout.desc,
                 "a sampled texture's memory is not committed"
             );
-            return (0, false);
+            return (0, Vec::new());
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        // Each part hashed on its own: a part whose bytes did not change
+        // keeps what it detiled to.
+        last.hashes.resize(self.parts.len(), None);
+        let dirty: Vec<bool> = self
+            .parts
+            .iter()
+            .zip(&mut last.hashes)
+            .map(|(p, held)| {
+                let hash = blake3::hash(&tiled[p.from..p.to]);
+                held.replace(hash) != Some(hash)
+            })
+            .collect();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
-            return (size, false);
-        }
-        last.hash = Some(hash);
-        self.detile(tiled);
+        let detiled = self.detile(tiled, &dirty);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        (size, true)
+        if !detiled.is_empty() {
+            crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+        }
+        (size, detiled)
     }
 
-    /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
-        #[cfg(feature = "diagnostics")]
-        if tiled.iter().all(|&b| b == 0) {
-            tracing::debug!(
-                memory = ?self.memory,
-                desc = ?self.layout.desc,
-                "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
-            );
-        }
-        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
-            let f = footprint.Footprint;
-            let pitch = f.RowPitch as usize;
-            let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
-            // SAFETY: `subresource_len` clamps `len` to `self.size - footprint.Offset`,
-            // keeping the slice strictly inside the mapped staging buffer even when
-            // GetCopyableFootprints does not pad the final row of the last subresource.
-            let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
-            };
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
-                return;
+    /// Detiles the subresources of the `dirty` parts from `tiled` (the
+    /// texture's memory) into the staging buffer: those it detiled.
+    fn detile(&self, tiled: &[u8], dirty: &[bool]) -> Vec<u32> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut done = Vec::new();
+        let mut kept = 0u64;
+        'parts: for (part, _) in self.parts.iter().zip(dirty).filter(|(_, d)| **d) {
+            for &index in &part.subresources {
+                let i = index as usize;
+                let (Some(footprint), Some(&rows)) = (self.footprints.get(i), self.rows.get(i)) else {
+                    continue;
+                };
+                let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+                let f = footprint.Footprint;
+                let pitch = f.RowPitch as usize;
+                let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
+                // SAFETY: `subresource_len` clamps `len` to `self.size - footprint.Offset`,
+                // keeping the slice strictly inside the mapped staging buffer even when
+                // GetCopyableFootprints does not pad the final row of the last subresource.
+                let linear = unsafe {
+                    std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+                };
+                if let Err(e) =
+                    self.layout
+                        .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                {
+                    tracing::warn!(?e, mip, slice, "texture not detiled");
+                    break 'parts;
+                }
+                done.push(index);
             }
         }
+        for (part, _) in self.parts.iter().zip(dirty).filter(|(_, d)| !**d) {
+            kept += part.subresources.len() as u64;
+        }
+        if !done.is_empty() {
+            REFRESHES[0].fetch_add(1, Relaxed);
+            REFRESHES[1].fetch_add(done.len() as u64, Relaxed);
+            REFRESHES[2].fetch_add(kept, Relaxed);
+            #[cfg(feature = "diagnostics")]
+            self.report_streamed(tiled);
+        }
+        done
+    }
+
+    /// Reports (once per texture, the first 64 textures) a texture whose
+    /// finer mips are all zero while a coarser one is not: streamed in part,
+    /// its finest mips not loaded (yet, or a failed read). Sampled there
+    /// without a clamp keeping the sample off them, it reads black or
+    /// garbage up close while the distance looks right; with views of all
+    /// mips, the texture wants the title's clamp (`_cl` samples, the view's
+    /// minimum level). All zero: not streamed at all.
+    #[cfg(feature = "diagnostics")]
+    fn report_streamed(&self, tiled: &[u8]) {
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+        static REPORTED: AtomicU32 = AtomicU32::new(0);
+        if self.reported.load(Relaxed) || REPORTED.load(Relaxed) >= 64 {
+            return;
+        }
+        // Mips of the first slice, finest first (each tail mip its share of
+        // the tail block; a mip without a range counts as loaded).
+        let empty: Vec<bool> = (0..self.mips)
+            .map(|mip| {
+                self.layout.tiled_extent(mip, 0).is_ok_and(|(from, to)| {
+                    tiled
+                        .get(from as usize..to as usize)
+                        .is_some_and(|bytes| bytes.iter().all(|&b| b == 0))
+                })
+            })
+            .collect();
+        let Some(coarse) = empty.iter().rposition(|e| !e) else {
+            if !empty.is_empty() {
+                tracing::debug!(
+                    memory = ?self.memory,
+                    desc = ?self.layout.desc,
+                    "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
+                );
+            }
+            return;
+        };
+        let missing: Vec<usize> = (0..coarse).filter(|&m| empty[m]).collect();
+        if missing.is_empty() || self.reported.swap(true, Relaxed) {
+            return;
+        }
+        REPORTED.fetch_add(1, Relaxed);
+        tracing::info!(
+            memory = ?self.memory,
+            desc = ?self.layout.desc,
+            ?missing,
+            loaded_from = coarse,
+            "a sampled texture is streamed in part: these mips are all zero, coarser ones are not"
+        );
     }
 }
 
@@ -467,6 +642,19 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let layout_size = layout.size as usize;
+    let mips = u32::from(d.MipLevels).max(1);
+    // The tiled bytes each subresource reads (all of them where the layout
+    // cannot say: changed with any write).
+    let extents: Vec<(usize, usize)> = (0..count)
+        .map(|i| {
+            layout
+                .tiled_extent(i % mips, i / mips)
+                .ok()
+                .map(|(from, to)| (from as usize, (to as usize).min(layout_size)))
+                .filter(|&(from, to)| from < to)
+                .unwrap_or((0, layout_size))
+        })
+        .collect();
     let s = Arc::new(Staging {
         buffer,
         size: total,
@@ -474,10 +662,13 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         footprints,
         rows,
         layout,
-        mips: u32::from(d.MipLevels),
+        mips,
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
+        parts: parts(&extents),
         last: Mutex::default(),
+        #[cfg(feature = "diagnostics")]
+        reported: std::sync::atomic::AtomicBool::new(false),
     });
     *held = Some(s.clone());
     Some(s)
@@ -486,6 +677,33 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Subresources whose tiled bytes overlap (the mip tail's, a volume's
+    /// slabs) form one part; a write touches the parts it overlaps only.
+    #[test]
+    fn parts_group_overlapping_subresources() {
+        // Mip 0 at [64K, 128K), mips 1 and 2 in the tail block [0, 64K),
+        // then a second slice's three mips 128K on.
+        let extents = [
+            (65536, 131072),
+            (32768, 40000),
+            (0, 30000),
+            (196608, 262144),
+            (163840, 171000),
+            (131072, 160000),
+        ];
+        let p = parts(&extents);
+        let subresources: Vec<Vec<u32>> = p.iter().map(|p| p.subresources.clone()).collect();
+        assert_eq!(subresources, [vec![2], vec![1], vec![0], vec![5], vec![4], vec![3]]);
+        // Overlapping tail mips are one part.
+        let p = parts(&[(65536, 131072), (0, 40000), (32768, 65536)]);
+        assert_eq!(p.len(), 2);
+        assert_eq!((p[0].from, p[0].to, p[0].subresources.clone()), (0, 65536, vec![1, 2]));
+        // A page written in mip 0 only, then one across the tail and mip 0.
+        assert_eq!(touched(&p, &[(65536 + 4096, 65536 + 8192)]), [false, true]);
+        assert_eq!(touched(&p, &[(60000, 70000)]), [true, true]);
+        assert_eq!(touched(&p, &[(131072, 140000)]), [false, false]);
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {

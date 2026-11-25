@@ -195,6 +195,15 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 Every build appends unhandled exceptions, panics, and host GPU failures to
 `crashes.log` in the title's data folder.
 
+Textures the title streams: every five seconds, with the frame-rate line,
+`texture refreshes N/frame: D subresources/frame detiled, K unchanged kept`.
+A write into a texture's memory detiles (and, for heap-indexed views,
+uploads) only the mips and slices whose bytes it touched; `K` is what that
+saved. A diagnostics build also logs `a sampled texture is streamed in
+part` for the first 64 textures whose finer mips are all zero while a
+coarser one is not: if surfaces look right far away but black, smeared or
+warped up close, those are the textures to look at.
+
 For a startup breakpoint (`0x80000003`), run the diagnostics build with
 `VICTORY_CRASH_BREAKPOINTS=1`. Keep the console output along with the new
 `crashes.log` entries. A host DLL refusal includes the caller stack in the

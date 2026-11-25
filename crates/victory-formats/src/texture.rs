@@ -632,6 +632,52 @@ impl Layout {
         })
     }
 
+    /// The bytes of tiled memory one subresource reads (as
+    /// [`Layout::detile`] names it): from its first to past its last byte.
+    /// Mips in the tail share their block; a thick 3D mip spans its slabs,
+    /// with other mips' bytes between. So a write outside the range leaves
+    /// the subresource as it was, one inside may not change it.
+    pub fn tiled_extent(&self, mip: u32, slice: u32) -> Result<(u64, u64), Error> {
+        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let first = if self.desc.dimension == Dimension::Tex3d {
+            if slice != 0 {
+                return Err(Error::Invalid);
+            }
+            0
+        } else {
+            slice
+        };
+        if first >= self.slices || m.width == 0 || m.height == 0 || m.depth == 0 {
+            return Err(Error::Invalid);
+        }
+        if !self.addressable() {
+            return Err(Error::Unsupported);
+        }
+        let n = u64::from(self.desc.element_bytes);
+        let linear = self.desc.swizzle == Swizzle::LINEAR;
+        // An element's address is a row part (row and depth) plus a column
+        // part, as in `walk`: the least and greatest of each, added.
+        let (mut low, mut high) = (u64::MAX, 0);
+        for z in 0..m.depth {
+            let (s, inner) = self.split(first + z);
+            let base = u64::from(s) * self.slice_size + m.offset;
+            for y in 0..m.height {
+                let row = if linear {
+                    base + u64::from(y) * u64::from(m.pitch) * n
+                } else {
+                    base + self.row(m, y, inner)
+                };
+                (low, high) = (low.min(row), high.max(row));
+            }
+        }
+        let (columns, last) = if linear {
+            (0, u64::from(m.width - 1) * n)
+        } else {
+            (0..m.width).map(|x| self.column(m, x)).fold((u64::MAX, 0), |(a, b), c| (a.min(c), b.max(c)))
+        };
+        Ok((low + columns, high + last + n))
+    }
+
     /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
     #[allow(clippy::too_many_arguments)]
     fn walk(
@@ -1092,6 +1138,78 @@ mod tests {
         assert_eq!(l.mips[2].offset, 4096);
         assert_eq!(l.mips[1].offset, 8192);
         assert_eq!(l.mips[0].offset, 8192 + 16384);
+    }
+
+    /// A subresource's tiled extent holds every element it reads, and bytes
+    /// outside it do not change what it detiles to (what partial texture
+    /// refreshes rely on). The tail's mips share the tail block.
+    #[test]
+    fn tiled_extents_bound_what_a_subresource_reads() {
+        let l = Layout::new(&desc(64, 64, 9, 16, Swizzle::SW_64KB_D)).unwrap();
+        assert_eq!(l.tiled_extent(0, 0), Ok((65536, 131072)));
+        for mip in 1..9 {
+            let (from, to) = l.tiled_extent(mip, 0).unwrap();
+            assert!(to <= 65536, "tail mip {mip}: {from}..{to}");
+        }
+        assert_eq!(l.tiled_extent(9, 0), Err(Error::Invalid));
+        let cases = [
+            desc(100, 60, 7, 4, Swizzle::SW_64KB_D),
+            desc(250, 175, 8, 8, Swizzle::SW_4KB_S),
+            desc(30, 20, 5, 4, Swizzle::LINEAR),
+            Desc {
+                block: 4,
+                ..desc(109, 71, 6, 16, Swizzle::SW_256B_D)
+            },
+            Desc {
+                depth: 3,
+                ..desc(70, 70, 4, 16, Swizzle::SW_4KB_S)
+            },
+            Desc {
+                dimension: Dimension::Tex3d,
+                depth: 16,
+                ..desc(64, 32, 7, 4, Swizzle::SW_4KB_S)
+            },
+            Desc {
+                dimension: Dimension::Tex3d,
+                depth: 64,
+                ..desc(16, 16, 4, 4, Swizzle::SW_64KB_S)
+            },
+        ];
+        for d in cases {
+            let l = Layout::new(&d).unwrap();
+            let n = d.element_bytes as usize;
+            let tiled: Vec<u8> = (0..l.size as usize).map(|i| (i * 31 + i / 251) as u8).collect();
+            let slices = if d.dimension == Dimension::Tex3d { 1 } else { d.depth };
+            for slice in 0..slices {
+                for mip in 0..d.mips {
+                    let m = l.mips[mip as usize];
+                    let (from, to) = l.tiled_extent(mip, slice).unwrap();
+                    let (from, to) = (from as usize, to as usize);
+                    assert!(from < to && to <= l.size as usize, "{d:?} mip {mip} slice {slice}");
+                    for z in 0..m.depth {
+                        for y in 0..m.height {
+                            for x in 0..m.width {
+                                let at = l.offset(mip, x, y, slice + z).unwrap() as usize;
+                                assert!(from <= at && at + n <= to, "{d:?} mip {mip} ({x},{y},{z})");
+                            }
+                        }
+                    }
+                    let row = m.width as usize * n;
+                    let plane = row * m.height as usize;
+                    let mut want = vec![0; plane * m.depth as usize];
+                    l.detile(&tiled, mip, slice, &mut want, row, plane).unwrap();
+                    let mut outside = tiled.clone();
+                    for (i, b) in outside.iter_mut().enumerate() {
+                        if !(from..to).contains(&i) {
+                            *b = !*b;
+                        }
+                    }
+                    let mut got = vec![0; want.len()];
+                    l.detile(&outside, mip, slice, &mut got, row, plane).unwrap();
+                    assert_eq!(got, want, "{d:?} mip {mip} slice {slice}");
+                }
+            }
+        }
     }
 
     /// A volume deeper than its block keeps its whole chain in the tail when

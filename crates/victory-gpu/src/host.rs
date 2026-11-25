@@ -2356,6 +2356,10 @@ impl Meter {
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
+        // Textures the title streams: refreshes that detiled, and of
+        // their subresources those detiled and those left as they were.
+        let [refreshed, detiled, kept] = [0, 1, 2]
+            .map(|i| crate::texture::REFRESHES[i].swap(0, Ordering::Relaxed) as f64 / frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let root_views = crate::draw::take_root_view_slots() as f64 / frames;
@@ -2371,6 +2375,10 @@ impl Meter {
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
                 making = crate::pipeline::making()
+            );
+            tracing::info!(
+                "texture refreshes {refreshed:.1}/frame: {detiled:.1} subresources/frame detiled, \
+                 {kept:.1} unchanged kept"
             );
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             tracing::info!(
