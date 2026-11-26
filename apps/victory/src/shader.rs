@@ -169,7 +169,9 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     None => "no parsable DXIL program".to_owned(),
                 } + &native;
                 if verbose {
-                    println!("{}{}: {line}", path.display(), source.label());
+                    // (the hash the runtime's logs name the shader by)
+                    let hash = &blake3::hash(&bytes).to_hex()[..16];
+                    println!("{}{} hash {hash}: {line}", path.display(), source.label());
                     for l in &listing {
                         println!("{l}");
                     }
@@ -224,4 +226,136 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
+}
+
+/// `shader-find`: prints each container that holds one of `needles` (hex
+/// strings), in its bytes or in its native programs' code.
+pub fn find(paths: Vec<PathBuf>, needles: &[String]) -> Result<()> {
+    let wanted: Vec<(String, Vec<u8>)> = needles
+        .iter()
+        .filter_map(|h| {
+            let h: String = h.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+            let bytes: Option<Vec<u8>> =
+                (0..h.len() / 2).map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).ok()).collect();
+            bytes.map(|b| (h, b))
+        })
+        .collect();
+    let mut containers = 0usize;
+    for root in &paths {
+        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+                continue;
+            }
+            let Ok(data) = std::fs::read(entry.path()) else { continue };
+            for source in sources(&data) {
+                let Some(bytes) = source.bytes() else { continue };
+                let Ok(container) = Container::parse(&bytes) else { continue };
+                containers += 1;
+                let code: Vec<Vec<u8>> = container
+                    .part(FourCC::DXIL)
+                    .and_then(|p| native_programs(p.data).ok())
+                    .map(|ps| ps.into_iter().map(|p| p.code).collect())
+                    .unwrap_or_default();
+                for (hex, needle) in &wanted {
+                    let inside = |hay: &[u8]| memchr::memmem::find(hay, needle).is_some();
+                    let where_ = if inside(&bytes) {
+                        Some("container")
+                    } else if code.iter().any(|c| inside(c)) {
+                        Some("native code")
+                    } else {
+                        None
+                    };
+                    if let Some(w) = where_ {
+                        println!(
+                            "{hex} in {w}: {} {} blake3 {}",
+                            entry.path().display(),
+                            source.label(),
+                            &blake3::hash(&bytes).to_hex()[..16]
+                        );
+                    }
+                }
+            }
+        }
+    }
+    println!("{containers} containers searched");
+    Ok(())
+}
+
+/// A container's stage hash: the 16 bytes after the flags word of its
+/// `HASH` part (what the console's precompiled pipelines name a stage by).
+pub(crate) fn stage_hash(container: &[u8]) -> Option<[u8; 16]> {
+    let c = Container::parse(container).ok()?;
+    c.part(FourCC::HASH)?.data.get(4..20)?.try_into().ok()
+}
+
+/// The title's shader archive by stage hash ([`stage_hash`]): where each
+/// container's packed record lies, found once (about 3 s, on the thread
+/// that first asks, or ahead by [`ArchiveIndex::warm`]); containers are
+/// unpacked as asked. The archive stays as it is on disk.
+pub(crate) struct ArchiveIndex {
+    path: PathBuf,
+    index: std::sync::OnceLock<std::collections::HashMap<[u8; 16], usize>>,
+}
+
+impl ArchiveIndex {
+    pub(crate) fn new(path: PathBuf) -> std::sync::Arc<ArchiveIndex> {
+        std::sync::Arc::new(ArchiveIndex { path, index: std::sync::OnceLock::new() })
+    }
+
+    fn index(&self) -> &std::collections::HashMap<[u8; 16], usize> {
+        self.index.get_or_init(|| {
+            let started = std::time::Instant::now();
+            let mut map = std::collections::HashMap::new();
+            if let Ok(data) = std::fs::read(&self.path) {
+                for record in sgd5::records(&data) {
+                    if let Some(bytes) = record.unpack()
+                        && let Some(h) = stage_hash(&bytes)
+                    {
+                        map.entry(h).or_insert(record.offset);
+                    }
+                }
+            }
+            eprintln!(
+                "shader archive index: {} stage hashes in {:.1} s",
+                map.len(),
+                started.elapsed().as_secs_f32()
+            );
+            map
+        })
+    }
+
+    /// Builds the index on a thread of its own.
+    pub(crate) fn warm(self: &std::sync::Arc<Self>) {
+        let me = self.clone();
+        let _ = std::thread::Builder::new().name("victory-archive-index".into()).spawn(move || {
+            me.index();
+        });
+    }
+
+    /// The containers of `hashes`, unpacked from their records.
+    pub(crate) fn find(&self, hashes: &[[u8; 16]]) -> Vec<Option<Vec<u8>>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let index = self.index();
+        hashes
+            .iter()
+            .map(|h| {
+                let &at = index.get(h)?;
+                // The record's size precedes its marker; its name before that.
+                const BEFORE: usize = 512;
+                let from = at.saturating_sub(BEFORE);
+                let mut file = std::fs::File::open(&self.path).ok()?;
+                file.seek(SeekFrom::Start((at - 4) as u64)).ok()?;
+                let mut n = [0u8; 4];
+                file.read_exact(&mut n).ok()?;
+                let n = u32::from_le_bytes(n) as usize;
+                if n > 64 << 20 {
+                    return None;
+                }
+                let mut buf = vec![0u8; at + n - from];
+                file.seek(SeekFrom::Start(from as u64)).ok()?;
+                file.read_exact(&mut buf).ok()?;
+                sgd5::records(&buf).find(|r| r.offset == at - from)?.unpack()
+            })
+            .collect()
+    }
 }

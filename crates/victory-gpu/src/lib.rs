@@ -33,6 +33,10 @@ mod drvwatch;
 #[cfg(windows)]
 mod fpsbox;
 #[cfg(windows)]
+mod gpudetile;
+#[cfg(windows)]
+mod gpuupload;
+#[cfg(windows)]
 mod spread;
 #[cfg(windows)]
 mod draw;
@@ -43,6 +47,9 @@ pub mod frame;
 pub mod framelog;
 #[cfg(windows)]
 mod host;
+pub mod ledger;
+#[cfg(windows)]
+pub mod rt;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
@@ -50,6 +57,8 @@ mod inplace;
 pub mod list;
 pub mod object;
 pub mod pipeline;
+#[cfg(windows)]
+mod poolheap;
 #[cfg(windows)]
 mod plaincopy;
 #[cfg(windows)]
@@ -67,7 +76,13 @@ mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
+mod ambient;
+#[cfg(all(windows, victory_dlss))]
+mod dlss;
+#[cfg(windows)]
 mod memory;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod sample;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]

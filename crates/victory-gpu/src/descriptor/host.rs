@@ -800,6 +800,14 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// the last slot is the null slot every view index at or past it reads.
 const UNCAPPED_VIEWS: u32 = 1 << 21;
 
+/// The size of a host constant buffer view for `size` bytes: whole 256s,
+/// and at most the 64 KB a shader can address through one. A title's
+/// constant buffer over a larger range (1.7 MB, run `refused-debug-*`) was
+/// a view the host does not allow: the debug layer removed the device for it.
+fn constant_view_size(size: u32) -> u32 {
+    size.next_multiple_of(256).min(D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16)
+}
+
 /// Picks, once, the null slot at the end of every host view heap and tells
 /// the translator now (`set_view_heap_limit`) instead of when the title's
 /// heap is made: a shader keeps the limit it was translated with, and the
@@ -1779,7 +1787,7 @@ impl HostHeap {
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+            SizeInBytes: constant_view_size(size),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -2052,6 +2060,26 @@ impl HostHeap {
         }
         let view = view_at(key as u32, (key >> 32) as u32)?;
         let mut text: String = format!("{view:?}").chars().take(120).collect();
+        // A texture placed in title memory: the catalog asset that starts
+        // there (`crate::ledger`), and the state of VIctory's copy of it.
+        if let View::Placed(false, resource, desc) = &view
+            && resource[0] != 1
+        {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            match crate::ledger::asset_at(address) {
+                Some((asset, frame)) => text.push_str(&format!(" ASSET[{asset} arrived frame {frame}]")),
+                None => text.push_str(&format!(" asset? (none of {} known starts at {address:#x})", crate::ledger::known())),
+            }
+            match crate::resource::texture_at_made(address, resource) {
+                Some(texture) => match crate::texture::staged(texture) {
+                    Some((bytes, whole)) => {
+                        text.push_str(&format!(" host copy {} ({bytes} B)", if whole { "whole" } else { "PART MAPPED" }))
+                    }
+                    None => text.push_str(" host copy made, NOT STAGED (let go or not uploaded yet)"),
+                },
+                None => text.push_str(" NO HOST COPY"),
+            }
+        }
         if let Some((address, len)) = buffer_range(&view) {
             let host = crate::shadow::find(address, len.max(1)).map(|s| s.gpu(address));
             text.push_str(&format!(" title {address:#x}+{len:#x} host {host:#x?}"));
@@ -2719,7 +2747,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: constant_view_size(size),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };

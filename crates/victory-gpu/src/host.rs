@@ -581,6 +581,8 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
     static HOST: OnceLock<Option<Host>> = OnceLock::new();
+    #[cfg(feature = "diagnostics")]
+    crate::sample::start();
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
         Err(e) => {
@@ -1939,8 +1941,9 @@ enum Step {
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
-    /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>),
+    /// whichever lists sample it, until a `Copy` or `Run` intervenes. With
+    /// the host texture if the card uploads it (`crate::gpuupload`).
+    Texture(std::sync::Arc<crate::texture::Staging>, Option<ID3D12Resource>),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -1948,6 +1951,8 @@ enum Step {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    /// Numbered title-memory copies made ready by this recording.
+    memory_copies: crate::memory::PreparedCopies,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
@@ -1970,6 +1975,8 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    #[cfg(all(feature = "diagnostics", victory_dlss))]
+    dlss_captures: Vec<crate::capture::DlssCapture>,
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
@@ -2646,7 +2653,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging, _) => {
                     let (at, len) = staging.memory();
                     if touches(written, at, at + len) {
                         if count {
@@ -3644,7 +3651,11 @@ pub(crate) fn walls_trace() -> bool {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
-    for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
+    #[allow(unused_mut)]
+    let mut deferred = list.deferred();
+    #[cfg(all(feature = "diagnostics", victory_dlss))]
+    let captures = std::mem::take(&mut deferred.dlss_captures);
+    for (buffer, at, [row, rows, pitch]) in &deferred.backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
         // run; the title's destination holds every row (checked when the
@@ -3671,6 +3682,11 @@ fn read_backs(list: &HostList) {
                 buffer.Unmap(0, None);
             }
         }
+    }
+    drop(deferred);
+    #[cfg(all(feature = "diagnostics", victory_dlss))]
+    for capture in captures {
+        capture.save();
     }
 }
 
@@ -5458,15 +5474,23 @@ impl Host {
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+            // Opt in to adding texture spans. These overlap many guarded
+            // views and have not shown a consistent frame-time benefit.
+            static TEXTURES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let textures = *TEXTURES.get_or_init(|| std::env::var_os("VICTORY_ASK_TEXTURES").is_some_and(|v| v == "1"));
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                    match step {
+                        Step::Refresh(shadow, address, len) if !shadow.unwatched() => {
+                            let span = spans
+                                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                                .or_insert((*address, *address + *len));
+                            *span = (span.0.min(*address), span.1.max(*address + *len));
+                        }
+                        Step::Texture(staging, _) if textures => {
+                            spans.entry(std::sync::Arc::as_ptr(staging) as usize).or_insert(staging.span());
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -6428,7 +6452,11 @@ impl HostList {
         // The records the list's draws read from slots (`crate::indirect::gather`).
         let gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
         let gathered = gather.sets.iter().any(|s| s.records() > 0);
-        if barriers.is_empty() && syncs.is_empty() && !gathered {
+        // Textures the card uploads (`crate::gpuupload`), copied into at the
+        // prelude's end.
+        let key = std::ptr::from_ref(self) as usize;
+        let card = crate::gpuupload::pending(key);
+        if barriers.is_empty() && syncs.is_empty() && !gathered && !card {
             return None;
         }
         let Some((allocator, list)) = self
@@ -6469,6 +6497,11 @@ impl HostList {
                     if !filled {
                         fail(format_args!("a list's gathered indirect records could not be clamped in its prelude"));
                     }
+                }
+                // After the moves: the textures are where the list starts
+                // them, the card uploads' in the copy destination state.
+                if card {
+                    crate::gpuupload::record(key, list);
                 }
                 #[cfg(feature = "diagnostics")]
                 crate::shot::span_end(list, shot_span, std::ptr::from_ref(self) as usize, || {
@@ -6710,6 +6743,13 @@ impl HostList {
     /// the list is reset.
     pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
         self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
+    }
+
+    #[cfg(all(feature = "diagnostics", victory_dlss))]
+    pub(crate) fn defer_dlss_capture(&self, capture: crate::capture::DlssCapture) {
+        // A closed list can be submitted again after we saved its first capture.
+        self.keep(&capture.buffer);
+        self.deferred().dlss_captures.push(capture);
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -6980,6 +7020,10 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    pub(crate) fn prepare_memory_copies(&self, end: usize, writes: bool) -> (usize, usize) {
+        self.deferred().memory_copies.extend(end, writes)
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
@@ -6993,9 +7037,10 @@ impl HostList {
     }
 
     /// Brings a texture's staging buffer up to date when the list is
-    /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
-        self.deferred().copies.push(Step::Texture(staging));
+    /// submitted, keeping it alive until the list is reset; `texture`, the
+    /// host texture, for one the card uploads (held as long).
+    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>, texture: Option<ID3D12Resource>) {
+        self.deferred().copies.push(Step::Texture(staging, texture));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -7004,7 +7049,17 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        // Textures due, detiled together before the next step that writes
+        // title memory and at the end ([`refresh_textures`]).
+        let key = std::ptr::from_ref(self) as usize;
+        // Work for the card a submission of this list queued and no
+        // prelude took is stale now.
+        crate::gpuupload::forget(key);
+        let mut textures = Vec::new();
         for step in &self.deferred().copies {
+            if matches!(step, Step::Copy(..) | Step::Run(_)) {
+                refresh_textures(&mut textures, key);
+            }
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -7074,9 +7129,9 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging, texture) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        textures.push((staging.clone(), texture.clone()));
                     }
                     continue;
                 }
@@ -7084,7 +7139,40 @@ impl HostList {
             preparing(0, started.elapsed().as_micros() as u64);
             preparing(1, copied as u64);
         }
+        refresh_textures(&mut textures, key);
     }
+}
+
+/// Detiles the textures a list's submission found due, on the threads kept
+/// for the snapshots (`crate::shadow::wide_run`) when there are several.
+/// With the precompiled pipelines a world frame samples many more textures,
+/// and detiling them one after another on the submitting thread took up to
+/// 485 ms a frame (run `precomp-rects-*`). Each refresh writes only its own
+/// staging buffer and reads title memory under its own shared lock, so the
+/// order among them does not matter; a step that writes title memory waits
+/// for them. `VICTORY_WIDE_TEXTURES=0` detiles them one after another.
+/// `key` is the list whose submission this is: work for the card that a
+/// refresh queues is that list's (`crate::gpuupload`).
+fn refresh_textures(textures: &mut Vec<(std::sync::Arc<crate::texture::Staging>, Option<ID3D12Resource>)>, key: usize) {
+    static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let wide = *WIDE.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_none_or(|v| v != "0"));
+    let refresh = move |staging: &crate::texture::Staging, texture: Option<ID3D12Resource>| {
+        crate::gpuupload::with_list(key, || match &texture {
+            Some(texture) if staging.card() => staging.refresh_card(texture),
+            _ => staging.refresh(),
+        })
+    };
+    if !wide || textures.len() < 2 {
+        for (staging, texture) in textures.drain(..) {
+            refresh(&staging, texture);
+        }
+        return;
+    }
+    let jobs: Vec<Box<dyn FnOnce() + Send>> = textures
+        .drain(..)
+        .map(|(staging, texture)| Box::new(move || refresh(&staging, texture)) as Box<dyn FnOnce() + Send>)
+        .collect();
+    crate::shadow::wide_run(jobs);
 }
 
 /// Whether a submission's refreshes of host copies run on several threads,
@@ -7535,6 +7623,11 @@ fn direct_writes() -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    #[cfg(feature = "diagnostics")]
+    if len > 0 {
+        // SAFETY: the caller's source holds `len` bytes.
+        crate::memory::trace::check_ones(dst as usize, unsafe { std::slice::from_raw_parts(src, len) }, (0, 0, false));
+    }
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
@@ -7734,6 +7827,7 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
+        crate::fpsbox::presented();
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
@@ -7749,6 +7843,7 @@ impl Meter {
         crate::fpsbox::set(fps);
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
+        crate::fpsbox::set_frame(draws, ms);
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
@@ -7812,6 +7907,13 @@ impl Meter {
         {
             let [own, asking, still, all] =
                 [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            #[cfg(feature = "diagnostics")]
+            {
+                let [ahead, kernel, guard] = [0, 1, 2].map(|i| crate::watch::TEXTURE_QUERIES[i].swap(0, Ordering::Relaxed));
+                if ahead + kernel + guard != 0 {
+                    tracing::info!("texture query answers this interval: journal {ahead}, kernel {kernel}, guards {guard}");
+                }
+            }
             if all >= 1.0 {
                 tracing::info!(
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
@@ -7931,6 +8033,7 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            crate::fpsbox::set_detail(cpu, gpu, dropped, crate::pipeline::making() as f64);
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \

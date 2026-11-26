@@ -989,6 +989,14 @@ impl State {
                 _ => {}
             }
         }
+        #[cfg(feature = "diagnostics")]
+        if crate::memory::trace::on() {
+            let name = crate::pipeline::host_pipeline_for(self.pipeline as This, self.topology == RECTANGLES).map_or_else(|| "?".to_owned(), |p| p.name.clone());
+            crate::memory::trace::label(
+                format!("{name} | roots:{}", self.roots_text(compute)),
+                crate::pipeline::is_builder(self.pipeline as This),
+            );
+        }
         crate::memory::ready(list, heap, &addresses, &constants, writes)
     }
 
@@ -1013,7 +1021,19 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        // `VICTORY_WATCH_SHADER`: the first 40 draws of a watched shader's pipelines, and
+        // every 200th after, with what they draw into, their state, the stencil reference and
+        // the values their stages read.
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_watched(self.pipeline as This) {
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            let n = SEEN.fetch_add(1, Ordering::Relaxed);
+            if n < 40 || n % 200 == 0 {
+                let text = self.op_text(format!("draw (topology {})", self.topology), false);
+                tracing::info!(n, frame = crate::frame::current(), stencil_ref = ?self.stencil, blend_factor = ?self.blend, "watched shader: {text}");
+            }
+        }
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, self.topology == RECTANGLES) else {
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -1159,7 +1179,11 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
-            STORES.set(t.stores);
+            // (a quarantined builder stage writes nothing back through its
+            // tables either: run `rt-on-quarantine2-*` died on a title pointer
+            // read as -1 a minute after the builder first ran, with only its
+            // root views and raw addresses kept out)
+            STORES.set(t.stores && !crate::pipeline::builder_quarantined(self.pipeline as This));
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
@@ -1172,6 +1196,12 @@ impl State {
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
+                // Only a program that stores through raw addresses may
+                // have written the copies it reaches that way: declaring
+                // them written for one that only reads them put the
+                // copies' older bytes back over the title's newer ones
+                // (the structure builder's crash: pointers read as -1).
+                let writes = writes && t.host.memory_stores;
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
@@ -1360,6 +1390,10 @@ impl State {
             s.refresh(list, a, len);
             if writes {
                 s.gpu_writes(list, a, len);
+            }
+            #[cfg(feature = "diagnostics")]
+            if crate::memory::trace::on() {
+                crate::memory::trace::declared("root UAV", a, len, writes);
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
@@ -1571,13 +1605,17 @@ impl State {
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
-        let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
-            ranges.clear();
-            host.buffer_slots()
-        } else {
-            changed
-        };
+        // The look at every slot is spread over the 16 passes, a sixteenth
+        // each (by slot number), with the slots written since the last
+        // pass: done whole every 16th pass it was a frame of its own
+        // (0.24-0.41 s a pass in runs `rt-builder-alone-*` and
+        // `rt-resolve-only-*`).
+        let mut slots = host.buffer_changes();
+        let part = (*passes % 16) as u32;
+        ranges.retain(|&index, _| index % 16 != part);
+        slots.extend(host.buffer_slots().into_iter().filter(|&index| index % 16 == part));
+        slots.sort_unstable();
+        slots.dedup();
         *passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
@@ -2165,31 +2203,137 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn list_dropped_roots(&self, groups: [u32; 3]) {
         crate::capture::op(0, || {
-            use std::fmt::Write;
             let [x, y, z] = groups;
-            let mut text = format!("  its roots ({x}x{y}x{z}):");
-            for (slot, root) in self.compute.iter().enumerate() {
-                match root {
-                    Root::None => {}
-                    Root::Table(a) => {
-                        let _ = write!(text, " {slot}=table {a:#x}");
-                    }
-                    Root::Constants(v) => {
-                        let _ = write!(text, " {slot}=constants {:x?}", &v[..v.len().min(48)]);
-                    }
-                    Root::View(a) => {
-                        let _ = write!(text, " {slot}=view {a:#x}");
-                        match crate::shadow::extent(*a) {
-                            Some((start, len)) => {
-                                let _ = write!(text, " in buffer {start:#x}+{len:#x}");
-                            }
-                            None => text.push_str(" in no buffer"),
+            format!("  its roots ({x}x{y}x{z}):{}", self.roots_text(true))
+        });
+    }
+
+    /// The root arguments as text (diagnostics): root constants as hex
+    /// dwords, root views with the title buffer they point into.
+    #[cfg(feature = "diagnostics")]
+    fn roots_text(&self, compute: bool) -> String {
+        use std::fmt::Write;
+        let mut text = String::new();
+        for (slot, root) in self.roots_ref(compute).iter().enumerate() {
+            match root {
+                Root::None => {}
+                Root::Table(a) => {
+                    let _ = write!(text, " {slot}=table {a:#x}");
+                }
+                Root::Constants(v) => {
+                    let _ = write!(text, " {slot}=constants {:x?}", &v[..v.len().min(48)]);
+                }
+                Root::View(a) => {
+                    let _ = write!(text, " {slot}=view {a:#x}");
+                    match crate::shadow::extent(*a) {
+                        Some((start, len)) => {
+                            let _ = write!(text, " in buffer {start:#x}+{len:#x}");
                         }
+                        None => text.push_str(" in no buffer"),
                     }
                 }
             }
-            text
-        });
+        }
+        text
+    }
+
+    /// The title's FidelityFX upscale, as DLSS ([`crate::dlss`]), at this
+    /// point of the list: its inputs made shader resources and its output
+    /// unordered access first. Whether DLSS ran (the list's pipeline, root
+    /// signature and heaps are then NGX's: the next draw or dispatch sets
+    /// them again).
+    #[cfg(victory_dlss)]
+    pub(crate) fn upscale(&mut self, list: &HostList, u: &crate::list::Upscale) -> bool {
+        const READ: u32 = 0x40 | 0x80;
+        const WRITE: u32 = 0x8;
+        let host = |r: usize| crate::resource::host_resource(r as This);
+        let (Some(color), Some(depth), Some(motion), Some(output)) = (host(u.color), host(u.depth), host(u.motion), host(u.output)) else {
+            once!("DLSS: a resource of the upscale has no host copy; nothing upscaled");
+            return false;
+        };
+        let exposure = (u.exposure != 0).then(|| host(u.exposure)).flatten();
+        for r in [u.color, u.depth, u.motion].into_iter().chain((u.exposure != 0).then_some(u.exposure)) {
+            crate::list::ensure_state(list, r as This, READ);
+        }
+        crate::list::ensure_state(list, u.output as This, WRITE);
+        let mut flags = 0;
+        for (on, flag) in [
+            (u.hdr, crate::dlss::FLAG_HDR),
+            (!u.mv_display_size, crate::dlss::FLAG_MV_LOW_RES),
+            (u.depth_inverted, crate::dlss::FLAG_DEPTH_INVERTED),
+            (u.auto_exposure || exposure.is_none(), crate::dlss::FLAG_AUTO_EXPOSURE),
+        ] {
+            if on {
+                flags |= flag;
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        let capture = crate::capture::dlss_dispatch();
+        #[cfg(feature = "diagnostics")]
+        if let Some(n) = capture {
+            for (role, id) in [("color-in", u.color), ("depth", u.depth), ("motion", u.motion)] {
+                crate::capture::dlss_attachment(list, n, role, id, READ);
+            }
+        }
+        let done = crate::dlss::evaluate(
+            list,
+            crate::dlss::Frame {
+                color,
+                depth,
+                motion,
+                output,
+                exposure,
+                render: u.render,
+                upscale: u.upscale,
+                jitter: u.jitter,
+                mv_scale: u.mv_scale,
+                pre_exposure: u.pre_exposure,
+                reset: u.reset,
+                flags,
+            },
+        );
+        #[cfg(feature = "diagnostics")]
+        if done && let Some(n) = capture {
+            crate::capture::dlss_attachment(list, n, "color-out", u.output, WRITE);
+        }
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+        done
+    }
+
+    /// After a dispatch of `p`: the least indirect light, if it is the
+    /// program that resolves it ([`crate::ambient`]). Whether it recorded a
+    /// pass of ours (the list's pipeline, root signature and heaps are then
+    /// ours: they are set again by the next draw or dispatch).
+    fn ambient(&mut self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+            return false;
+        };
+        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            let u = stage.translated().used.iter().find(|u| {
+                u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+                return None;
+            };
+            crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+        };
+        let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
+            Some(View::Unordered(r, ..)) => r,
+            _ => 0,
+        };
+        if light == 0 {
+            once!("no ambient light: other tables");
+            return false;
+        }
+        let raised = crate::ambient::raise(list, light as This);
+        if raised {
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+            self.host_heaps = [0; 2];
+        }
+        raised
     }
 
     /// Whether the shaders of the pipeline bound now can store to buffers
@@ -2203,6 +2347,18 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        // `VICTORY_WATCH_SHADER` for compute work too: the first 40 dispatches of a
+        // watched shader's pipelines, and every 200th after, with the views its tables
+        // name (what is read and written, their formats and sizes).
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_watched(self.pipeline as This) {
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            let n = SEEN.fetch_add(1, Ordering::Relaxed);
+            if n < 40 || n % 200 == 0 {
+                let text = self.op_text(format!("dispatch {x}x{y}x{z}"), true);
+                tracing::info!(n, frame = crate::frame::current(), "watched shader: {text}");
+            }
+        }
         // It may write the arguments a window holds clamped.
         self.window = None;
         list.gather_close();
@@ -2228,7 +2384,7 @@ impl State {
             }
             return;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, self.topology == RECTANGLES) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
@@ -2255,10 +2411,16 @@ impl State {
             return;
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        {
+            list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+            if crate::memory::trace::on() {
+                crate::memory::trace::groups([x, y, z]);
+            }
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.ambient(list, p);
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -2268,7 +2430,7 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, self.topology == RECTANGLES) else {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
@@ -2878,7 +3040,7 @@ impl State {
     /// builds).
     #[cfg(feature = "diagnostics")]
     fn reads(&self, compute: bool) -> Vec<String> {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, self.topology == RECTANGLES) else {
             return vec!["no host pipeline".into()];
         };
         let mut out = Vec::new();
@@ -2946,13 +3108,13 @@ impl State {
     /// Whether the bound pipeline completes rectangles itself, in the
     /// geometry stage rectangle pipelines get (`HostPipeline::rects`).
     fn completes_rects(&self) -> bool {
-        crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rects)
+        crate::pipeline::host_pipeline_for(self.pipeline as This, self.topology == RECTANGLES).is_some_and(|p| p.rects)
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
     fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, self.topology == RECTANGLES) else {
             return false;
         };
         let rects = u64::from(count / 3);
@@ -3086,7 +3248,7 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, self.topology == RECTANGLES) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
@@ -3488,6 +3650,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
                 shadow.gpu_writes(list, address, len);
+                #[cfg(feature = "diagnostics")]
+                if crate::memory::trace::on() {
+                    crate::memory::trace::declared("table UAV", address, len, true);
+                }
             } else {
                 #[cfg(feature = "diagnostics")]
                 {
@@ -3663,15 +3829,31 @@ fn describe(view: Option<&View>) -> String {
             format!("{}x{} f{} flags {:#x} of {r:?}", d.Width, d.Height, d.Format.0, d.Flags.0)
         })
     };
+    // With `VICTORY_WATCH_BUF_BYTES=<n>`: the first n bytes of a buffer view's
+    // title memory as floats (what the CPU wrote there: a pass's blend-shape
+    // weights, bone matrices), to compare from frame to frame.
+    let peek = |v: &View| -> String {
+        static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let want = *BYTES.get_or_init(|| std::env::var("VICTORY_WATCH_BUF_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+        let Some((address, _)) = crate::descriptor::host::buffer_range(v) else { return String::new() };
+        let n = want & !3;
+        if n == 0 || address < 0x10000 || !crate::texture::committed(address as *const u8, n) {
+            return String::new();
+        }
+        // SAFETY: n committed bytes of title memory.
+        let words: Vec<f32> = (0..n / 4).map(|i| unsafe { (address as *const f32).add(i).read_unaligned() }).collect();
+        format!(" holds {words:?}")
+    };
     match view {
         None => "no view".into(),
         Some(v @ View::Shader(r, _)) => texture(*r as This)
-            .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
+            .unwrap_or_else(|| format!("buffer {:?}{}", crate::descriptor::host::buffer_range(v), peek(v))),
         Some(v @ View::Unordered(r, ..)) => match texture(*r as This) {
             Some(t) => format!("uav texture {t}"),
             None => format!(
-                "uav resource {r:#x} buffer {:?}",
-                crate::descriptor::host::buffer_range(v)
+                "uav resource {r:#x} buffer {:?}{}",
+                crate::descriptor::host::buffer_range(v),
+                peek(v)
             ),
         },
         Some(View::Placed(u, r, d)) => format!(
@@ -3683,12 +3865,20 @@ fn describe(view: Option<&View>) -> String {
             r[11],
             u64::from(d[10]) | u64::from(d[11]) << 32
         ),
-        // The first four values, as a colour rectangle's constants are.
-        Some(View::Constant(address, size))
-            if *size >= 16 && crate::texture::committed(*address as *const u8, 16) =>
-        {
-            // SAFETY: 16 committed bytes of title memory.
-            let v = unsafe { (*address as *const [f32; 4]).read_unaligned() };
+        // The first four values, as a colour rectangle's constants are; with
+        // `VICTORY_WATCH_CB_BYTES=<n>`, the first n bytes (a pass's jitter and
+        // matrices: TAA2's resolve keeps them in a 480-byte buffer).
+        Some(View::Constant(address, size)) => {
+            static BYTES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            let want = *BYTES.get_or_init(|| {
+                std::env::var("VICTORY_WATCH_CB_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(16)
+            });
+            let n = (*size).min(want.max(16)) as usize & !3;
+            if n < 16 || !crate::texture::committed(*address as *const u8, n) {
+                return format!("Constant({address:#x}, {size})");
+            }
+            // SAFETY: n committed bytes of title memory.
+            let v: Vec<f32> = (0..n / 4).map(|i| unsafe { (*address as *const f32).add(i).read_unaligned() }).collect();
             format!("Constant({address:#x}, {size}) {v:?}")
         }
         Some(v) => format!("{v:?}").chars().take(60).collect(),

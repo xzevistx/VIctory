@@ -12,10 +12,19 @@
 //! text and never written again, so a present still in the air reads what
 //! it was recorded with. On by default; `VICTORY_FPS_COUNTER=0` leaves the
 //! frame as the title drew it.
+//!
+//! The panel (on by default; F10 shows or hides it, `VICTORY_FPS_PANEL=0`
+//! keeps the box above instead) sits in the top right corner: the frame
+//! rate, the 1% low (the rate of the slowest hundredth of the last 1,000
+//! frames), the last second's time a frame and draws a frame, and a graph
+//! of the last 120 frames' times (green within the 30 FPS budget, yellow to
+//! 100 ms, red past it; the cyan line is 33.3 ms). It changes every frame,
+//! so it is drawn into one of a ring of buffers, the oldest of which a
+//! present has long read.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -37,6 +46,81 @@ pub(crate) fn set(fps: f64) {
     }
 }
 
+/// Draws a frame over the last second, for the panel.
+static DRAWS: AtomicU32 = AtomicU32::new(0);
+/// Milliseconds a frame over the last second, in tenths.
+static MS_TENTHS: AtomicU32 = AtomicU32::new(0);
+
+/// The last second's draws a frame and milliseconds a frame.
+pub(crate) fn set_frame(draws: f64, ms: f64) {
+    if draws.is_finite() && ms.is_finite() {
+        DRAWS.store(draws.max(0.0).min(9_999_999.0) as u32, Ordering::Relaxed);
+        MS_TENTHS.store((ms * 10.0).max(0.0).min(9_999_999.0) as u32, Ordering::Relaxed);
+    }
+}
+
+/// Of a frame over the last second: ms preparing on the CPU, ms waiting
+/// for the GPU, draws dropped for a shader without a host pipeline; and
+/// the pipelines being made now.
+static DETAIL: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+
+/// The last second's detail (see [`DETAIL`]).
+pub(crate) fn set_detail(cpu_ms: f64, gpu_ms: f64, dropped: f64, making: f64) {
+    for (slot, v) in DETAIL.iter().zip([cpu_ms, gpu_ms, dropped, making]) {
+        if v.is_finite() {
+            slot.store(v.round().clamp(0.0, 9_999_999.0) as u32, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The time of each of the last frames, in milliseconds, newest last.
+static TIMES: Mutex<(Option<std::time::Instant>, VecDeque<f32>)> = Mutex::new((None, VecDeque::new()));
+/// Frames the 1% low is taken over.
+const KEPT: usize = 1000;
+/// Frames the graph shows.
+const GRAPH: usize = 120;
+
+/// A frame was presented.
+pub(crate) fn presented() {
+    let now = std::time::Instant::now();
+    let mut times = TIMES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(last) = times.0.replace(now) {
+        times.1.push_back(now.duration_since(last).as_secs_f32() * 1000.0);
+        if times.1.len() > KEPT {
+            times.1.pop_front();
+        }
+    }
+}
+
+/// The 1% low: the frame rate of the mean of the slowest hundredth of
+/// `ms` (at least one frame), or none without frames.
+fn one_percent_low(ms: &[f32]) -> Option<f32> {
+    if ms.is_empty() {
+        return None;
+    }
+    let mut sorted = ms.to_vec();
+    sorted.sort_by(|a, b| b.total_cmp(a));
+    let n = sorted.len().div_ceil(100);
+    let mean = sorted[..n].iter().sum::<f32>() / n as f32;
+    (mean > 0.0).then(|| 1000.0 / mean)
+}
+
+/// Whether the panel is shown: F10 switches it (`VICTORY_FPS_PANEL=0`:
+/// hidden at the start).
+fn panel_shown() -> bool {
+    static SHOWN: std::sync::OnceLock<AtomicBool> = std::sync::OnceLock::new();
+    static DOWN: AtomicBool = AtomicBool::new(false);
+    let shown = SHOWN.get_or_init(|| AtomicBool::new(std::env::var_os("VICTORY_FPS_PANEL").is_none_or(|v| v != "0")));
+    // SAFETY: a plain query of the keyboard's state.
+    let down = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x79) } as u16 & 0x8000 != 0;
+    if down && !DOWN.swap(true, Ordering::Relaxed) {
+        shown.fetch_xor(true, Ordering::Relaxed);
+    } else if !down {
+        DOWN.store(false, Ordering::Relaxed);
+    }
+    shown.load(Ordering::Relaxed)
+}
+
 /// A glyph's seven rows, five dots each (bit 4 is the left one).
 fn glyph(c: char) -> [u8; 7] {
     match c {
@@ -54,6 +138,22 @@ fn glyph(c: char) -> [u8; 7] {
         'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
         'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
         'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
+        'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
+        'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001],
+        'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
+        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
+        'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
+        'D' => [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
+        '%' => [0b11001, 0b11010, 0b00010, 0b00100, 0b01000, 0b01011, 0b10011],
+        'C' => [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
+        'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        'G' => [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111],
+        'H' => [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
+        'I' => [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
         _ => [0; 7],
     }
 }
@@ -72,10 +172,31 @@ fn pixel_bytes(format: DXGI_FORMAT) -> Option<usize> {
     }
 }
 
-/// One pixel of `format`: of the text (`lit`) or of the box behind it.
-fn pixel(format: DXGI_FORMAT, lit: bool, out: &mut [u8]) {
+/// What a pixel of the box or panel shows.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Ink {
+    Box,
+    Text,
+    /// A frame within the 30 FPS budget.
+    Good,
+    /// A frame up to 100 ms.
+    Warn,
+    Bad,
+    /// The 33.3 ms line.
+    Line,
+}
+
+/// One pixel of `format` in `ink`.
+fn pixel(format: DXGI_FORMAT, ink: Ink, out: &mut [u8]) {
     // The text: a bright yellow. The box: nearly black.
-    let (r, g, b): (f32, f32, f32) = if lit { (1.0, 0.92, 0.16) } else { (0.03, 0.03, 0.03) };
+    let (r, g, b): (f32, f32, f32) = match ink {
+        Ink::Box => (0.03, 0.03, 0.03),
+        Ink::Text => (1.0, 0.92, 0.16),
+        Ink::Good => (0.2, 0.85, 0.3),
+        Ink::Warn => (0.95, 0.75, 0.1),
+        Ink::Bad => (0.95, 0.2, 0.15),
+        Ink::Line => (0.2, 0.8, 0.95),
+    };
     let byte = |v: f32| (v * 255.0).round() as u8;
     match format {
         DXGI_FORMAT_R8G8B8A8_UNORM => out.copy_from_slice(&[byte(r), byte(g), byte(b), 255]),
@@ -134,6 +255,141 @@ fn bitmap(text: &str, scale: u32) -> (u32, u32, Vec<bool>) {
     (width, height, lit)
 }
 
+/// The panel at `scale` dots a pixel: `lines` of text, then a graph of
+/// `ms` (frame times, oldest first) at most [`GRAPH`] bars wide. Its width
+/// and height and, row by row, each pixel's ink.
+fn panel(lines: &[String], ms: &[f32], scale: u32) -> (u32, u32, Vec<Ink>) {
+    let pad = 2 * scale;
+    let columns = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0).max(12) as u32;
+    let width = 2 * pad + columns * 6 * scale - scale;
+    let line_height = 9 * scale;
+    let graph_height = 24 * scale;
+    let height = 2 * pad + lines.len() as u32 * line_height + graph_height;
+    let mut ink = vec![Ink::Box; (width * height) as usize];
+    for (n, line) in lines.iter().enumerate() {
+        let (w, h, lit) = bitmap(line, scale);
+        let top = n as u32 * line_height;
+        for y in 0..h.min(height - top) {
+            for x in 0..w.min(width) {
+                if lit[(y * w + x) as usize] {
+                    ink[((top + y) * width + x) as usize] = Ink::Text;
+                }
+            }
+        }
+    }
+    // The graph: bars from the bottom, a pixel's height per `top / graph`
+    // ms, the scale's top the slowest frame shown or 100 ms.
+    let graph_top = pad + lines.len() as u32 * line_height;
+    let inner = width - 2 * pad;
+    let shown = &ms[ms.len().saturating_sub(GRAPH)..];
+    let top_ms = shown.iter().copied().fold(100.0f32, f32::max);
+    let bar = (inner / GRAPH as u32).max(1);
+    let to_rows = |v: f32| ((v / top_ms) * graph_height as f32).round().clamp(1.0, graph_height as f32) as u32;
+    let budget = graph_height - to_rows(1000.0 / 30.0);
+    for (i, &v) in shown.iter().enumerate() {
+        let x0 = pad + inner - (shown.len() - i) as u32 * bar;
+        let colour = if v <= 1000.0 / 30.0 + 0.5 { Ink::Good } else if v <= 100.0 { Ink::Warn } else { Ink::Bad };
+        let rows = to_rows(v);
+        for y in graph_height - rows..graph_height {
+            for x in x0..x0 + bar {
+                ink[((graph_top + y) * width + x) as usize] = colour;
+            }
+        }
+    }
+    for x in pad..pad + inner {
+        ink[((graph_top + budget) * width + x) as usize] = Ink::Line;
+    }
+    (width, height, ink)
+}
+
+/// The panel's lines.
+fn panel_lines(ms: &[f32]) -> Vec<String> {
+    let tenths = TENTHS.load(Ordering::Relaxed);
+    let fps = if tenths == u32::MAX { "-".to_owned() } else { format!("{}.{}", tenths / 10, tenths % 10) };
+    let low = one_percent_low(ms).map_or_else(|| "-".to_owned(), |v| format!("{v:.1}"));
+    let frame = MS_TENTHS.load(Ordering::Relaxed);
+    let [cpu, gpu, dropped, making] = DETAIL.each_ref().map(|v| v.load(Ordering::Relaxed));
+    vec![
+        format!("FPS {fps}"),
+        format!("1% LOW {low}"),
+        format!("FRAME {} MS", frame / 10),
+        format!("CPU {cpu} GPU {gpu}"),
+        format!("DRAWS {}", DRAWS.load(Ordering::Relaxed)),
+        format!("SHADERS BUILDING {making}"),
+        format!("NO SHADER {dropped}"),
+    ]
+}
+
+/// Buffers the panel is drawn into in turn.
+const RING: usize = 8;
+/// The next slot, and per slot: the buffer, its format and scale, and
+/// where it is mapped.
+static RING_BUFFERS: Mutex<(usize, Vec<Option<(Made, i32, u32, usize)>>)> = Mutex::new((0, Vec::new()));
+
+/// Copies the panel onto `back` in its top right corner (see [`draw`]).
+fn draw_panel(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, back: &ID3D12Resource, (width, height, format): (u32, u32, DXGI_FORMAT), bytes: usize) {
+    let scale = (height / 360).clamp(2, 12);
+    let ms: Vec<f32> = TIMES.lock().unwrap_or_else(|e| e.into_inner()).1.iter().copied().collect();
+    let (w, h, ink) = panel(&panel_lines(&ms), &ms, scale);
+    let margin = 4 * scale;
+    if w + 2 * margin > width || h + 2 * margin > height {
+        return;
+    }
+    let pitch = (w as usize * bytes).next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize);
+    let mut ring = RING_BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+    if ring.1.is_empty() {
+        ring.1.resize_with(RING, || None);
+    }
+    let slot = ring.0;
+    ring.0 = (slot + 1) % RING;
+    // A buffer is made again when the panel's size or format changes.
+    let fits = matches!(&ring.1[slot], Some((m, f, s, _)) if m.width == w && m.height == h && *f == format.0 && *s == scale);
+    if !fits {
+        let Some((buffer, data)) = host.shared_buffer((pitch * h as usize) as u64) else {
+            return;
+        };
+        ring.1[slot] = Some((Made { buffer, width: w, height: h, pitch: pitch as u32 }, format.0, scale, data as usize));
+    }
+    let Some((m, _, _, data)) = &ring.1[slot] else {
+        return;
+    };
+    // SAFETY: the buffer's own mapped bytes, `pitch * h` of them; the
+    // present that last read them is `RING` presents back.
+    let out = unsafe { std::slice::from_raw_parts_mut(*data as *mut u8, pitch * h as usize) };
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let at = y * pitch + x * bytes;
+            pixel(format, ink[y * w as usize + x], &mut out[at..at + bytes]);
+        }
+    }
+    copy_box(list, back, m, format, width - w - margin, margin);
+}
+
+/// Records a copy of `m` onto `back` at (`x`, `y`).
+fn copy_box(list: &ID3D12GraphicsCommandList, back: &ID3D12Resource, m: &Made, format: DXGI_FORMAT, x: u32, y: u32) {
+    // SAFETY: an open list; the back buffer is a copy's destination in it
+    // and the box lies inside it; our buffer holds `pitch * height` bytes
+    // and is kept for as long as the process runs.
+    unsafe {
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(&m.buffer),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: format, Width: m.width, Height: m.height, Depth: 1, RowPitch: m.pitch },
+                },
+            },
+        };
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(back),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        list.CopyTextureRegion(&to, x, y, 0, &from, None);
+    }
+}
+
 /// A buffer the card copies a text's box from, with its footprint.
 struct Made {
     buffer: ID3D12Resource,
@@ -160,6 +416,10 @@ pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, b
     let Some(bytes) = pixel_bytes(format).filter(|_| tenths != u32::MAX) else {
         return;
     };
+    if panel_shown() {
+        draw_panel(host, list, back, (width, height, format), bytes);
+        return;
+    }
     // About a fortieth of the frame's height a glyph: 6 dots a pixel at
     // 2160 lines, 3 at 1080.
     let scale = (height / 360).clamp(2, 12);
@@ -182,7 +442,8 @@ pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, b
         for y in 0..h as usize {
             for x in 0..w as usize {
                 let at = y * pitch + x * bytes;
-                pixel(format, lit[y * w as usize + x], &mut out[at..at + bytes]);
+                let ink = if lit[y * w as usize + x] { Ink::Text } else { Ink::Box };
+                pixel(format, ink, &mut out[at..at + bytes]);
             }
         }
         made.insert(key, Made { buffer, width: w, height: h, pitch: pitch as u32 });
@@ -194,27 +455,7 @@ pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, b
     if m.width + 2 * margin > width || m.height + 2 * margin > height {
         return;
     }
-    // SAFETY: an open list; the back buffer is a copy's destination in it
-    // and the box lies inside it; our buffer holds `pitch * height` bytes
-    // and is kept for as long as the process runs.
-    unsafe {
-        let from = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: std::mem::transmute_copy(&m.buffer),
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                    Offset: 0,
-                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: format, Width: m.width, Height: m.height, Depth: 1, RowPitch: m.pitch },
-                },
-            },
-        };
-        let to = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: std::mem::transmute_copy(back),
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-        };
-        list.CopyTextureRegion(&to, margin, margin, 0, &from, None);
-    }
+    copy_box(list, back, m, format, margin, margin);
 }
 
 #[cfg(test)]
@@ -251,20 +492,45 @@ mod tests {
     #[test]
     fn pixels_are_in_the_formats_the_layer_presents_in() {
         let mut four = [0u8; 4];
-        pixel(DXGI_FORMAT_R8G8B8A8_UNORM, true, &mut four);
+        pixel(DXGI_FORMAT_R8G8B8A8_UNORM, Ink::Text, &mut four);
         assert_eq!(four, [255, 235, 41, 255]);
-        pixel(DXGI_FORMAT_B8G8R8A8_UNORM, true, &mut four);
+        pixel(DXGI_FORMAT_B8G8R8A8_UNORM, Ink::Text, &mut four);
         assert_eq!(four, [41, 235, 255, 255]);
-        pixel(DXGI_FORMAT_R10G10B10A2_UNORM, true, &mut four);
+        pixel(DXGI_FORMAT_R10G10B10A2_UNORM, Ink::Text, &mut four);
         let v = u32::from_le_bytes(four);
         assert_eq!((v & 1023, v >> 10 & 1023, v >> 20 & 1023, v >> 30), (1023, 941, 164, 3));
         let mut eight = [0u8; 8];
-        pixel(DXGI_FORMAT_R16G16B16A16_FLOAT, true, &mut eight);
+        pixel(DXGI_FORMAT_R16G16B16A16_FLOAT, Ink::Text, &mut eight);
         assert_eq!(u16::from_le_bytes([eight[0], eight[1]]), 0x3C00, "1.0 as a half");
         assert_eq!(u16::from_le_bytes([eight[6], eight[7]]), 0x3C00);
         assert_eq!(half(0.5), 0x3800);
         assert_eq!(half(0.0), 0);
         assert_eq!(pixel_bytes(DXGI_FORMAT_R16G16B16A16_FLOAT), Some(8));
         assert_eq!(pixel_bytes(DXGI_FORMAT_D32_FLOAT), None);
+    }
+
+    #[test]
+    fn the_one_percent_low_is_the_slowest_hundredth() {
+        assert_eq!(one_percent_low(&[]), None);
+        // 200 frames: two of 100 ms, the rest 20 ms: the slowest two.
+        let mut ms = vec![20.0f32; 198];
+        ms.extend([100.0, 100.0]);
+        assert_eq!(one_percent_low(&ms), Some(10.0));
+        // Fewer than 100 frames: the slowest one.
+        assert_eq!(one_percent_low(&[20.0, 50.0]), Some(20.0));
+    }
+
+    #[test]
+    fn the_panel_holds_its_lines_and_graph() {
+        let lines: Vec<String> = ["FPS 5.2", "1% LOW 2.1", "FRAME 190 MS", "DRAWS 3200"].map(String::from).to_vec();
+        let ms: Vec<f32> = (0..300).map(|i| [20.0, 60.0, 250.0][i % 3]).collect();
+        let (w, h, ink) = panel(&lines, &ms, 3);
+        assert_eq!(ink.len(), (w * h) as usize);
+        for kind in [Ink::Text, Ink::Good, Ink::Warn, Ink::Bad, Ink::Line] {
+            assert!(ink.contains(&kind), "{kind:?}");
+        }
+        for c in "FPS1%LOWRAMEDS.0123456789CUGHNIB".chars() {
+            assert!(glyph(c).iter().any(|&r| r != 0), "{c}");
+        }
     }
 }

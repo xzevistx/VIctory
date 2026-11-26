@@ -31,6 +31,9 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
 use crate::{HleModule, hle_export};
 
+#[path = "dstorage/asset_catalog.rs"]
+mod asset_catalog;
+
 /// The factory interface the title asks for.
 const FACTORY: Guid = Guid::new(
     0x6295_9d11,
@@ -145,7 +148,8 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let asset_catalog = asset_catalog::Probe::open(&file, &name);
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file, asset_catalog });
     WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
     put(out, file)
 }
@@ -260,6 +264,7 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
+    asset_catalog: Option<asset_catalog::Probe>,
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -512,6 +517,13 @@ fn work(scheduler: &'static Scheduler) {
         drop(lanes);
         let started = std::time::Instant::now();
         let result = execute(&job.request);
+        if asset_catalog::enabled() && job.request.options & MEMORY_SOURCE == 0 && !job.request.source.is_null() {
+            // SAFETY: the title retains the DirectStorage file until this request completes.
+            let file = unsafe { &*job.request.source.cast::<Instance<File>>() };
+            if let Some(probe) = &file.state.asset_catalog {
+                probe.completed(&job.request, &result);
+            }
+        }
         walls_request(&job.request, &result, started);
         lanes = scheduler.lock();
         lanes.finish(&job, result);

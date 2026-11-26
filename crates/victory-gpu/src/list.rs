@@ -142,6 +142,46 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
+/// What the title's FidelityFX upscale dispatch names (its resources are the
+/// title's resource objects), for DLSS in its place ([`upscale`]).
+#[derive(Debug, Clone, Default)]
+pub struct Upscale {
+    pub color: usize,
+    pub depth: usize,
+    pub motion: usize,
+    /// None (0): the exposure is DLSS's own.
+    pub exposure: usize,
+    pub output: usize,
+    pub render: [u32; 2],
+    pub upscale: [u32; 2],
+    /// In render pixels.
+    pub jitter: [f32; 2],
+    pub mv_scale: [f32; 2],
+    pub pre_exposure: f32,
+    pub reset: bool,
+    pub hdr: bool,
+    pub depth_inverted: bool,
+    pub auto_exposure: bool,
+    /// The motion vectors are at the output size, not the render size.
+    pub mv_display_size: bool,
+}
+
+/// Records `u` on the title's list `list` as DLSS, at this point of it.
+/// Whether it did (false in a build without the DLSS SDK).
+pub fn upscale(list: usize, u: &Upscale) -> bool {
+    #[cfg(all(windows, victory_dlss))]
+    {
+        let mut done = false;
+        with_state(list as This, |host, state| done = state.upscale(host, u));
+        done
+    }
+    #[cfg(not(all(windows, victory_dlss)))]
+    {
+        let _ = (list, u);
+        false
+    }
+}
+
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
@@ -812,7 +852,81 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
-/// Buffer to buffer: both are host memory, copied at submission.
+/// Whether the title's buffer copies run on the card, between the host
+/// copies of its buffers (`VICTORY_GPU_COPIES=1`; off by default until
+/// measured), instead of on the CPU in title memory at submission.
+///
+/// On the console a buffer copy is GPU work, done in order behind the work
+/// before it, in the one memory both processors share. Done here on the CPU
+/// in title memory, a copy INTO memory that shaders of submissions still in
+/// the air may write has to wait for them and their copy-back first: run
+/// `dlss-balanced-4k-*` waited 64 ms a frame in such "title memory read"
+/// settles, at 212 ms a frame. On the card the copy needs no wait: the host
+/// copy of the source is brought up to date from title memory first (as a
+/// draw's would be), the copy is ordered against the list's shader writes
+/// by UAV barriers, and the destination counts as written by the card, so
+/// the copy-back puts it into title memory for the CPU once the list has
+/// run, as it does for shader writes.
+///
+/// shortcut: a CPU copy later in the same list that reads the destination
+/// (a buffer without a host copy on one side) sees it from before; and a
+/// copy only goes to the card where both sides already are title buffers
+/// the shadow map knows.
+#[cfg(windows)]
+fn gpu_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_COPIES").is_some_and(|v| v == "1"))
+}
+
+/// Buffer copies run on the card and on the CPU ([`gpu_copies`]), since the start.
+#[cfg(windows)]
+pub(crate) static BUFFER_COPIES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// `len` bytes from title buffer memory `from` to `to` on the card, between
+/// the host copies ([`gpu_copies`]). Whether it did; if not, the caller
+/// copies on the CPU.
+#[cfg(windows)]
+fn gpu_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: usize) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::Win32::Graphics::Direct3D12::{D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_TYPE_UAV};
+    if !gpu_copies() || len == 0 {
+        return false;
+    }
+    let (dst, src) = (to as u64, from as u64);
+    let (Some(source), Some(target)) = (crate::shadow::find(src, len as u64), crate::shadow::find(dst, len as u64)) else {
+        return false;
+    };
+    let (Some(src_at), Some(dst_at)) = (source.offset_in(src), target.offset_in(dst)) else {
+        return false;
+    };
+    // The source's host copy holds what the CPU wrote before the list runs.
+    list.defer_refresh(&source, src as usize, len);
+    let barrier = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        ..Default::default()
+    };
+    list.keep(&source.buffer);
+    list.keep(&target.buffer);
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("buffer copy on the card: {src:#x} to {dst:#x}, {len} bytes"));
+    // SAFETY: an open list; both host copies live (the list keeps them), the
+    // ranges inside them (`offset_in`, and `find` asked for `len` bytes).
+    unsafe {
+        list.list.ResourceBarrier(&[barrier.clone()]);
+        list.list.CopyBufferRegion(&target.buffer, dst_at, &source.buffer, src_at, len as u64);
+        list.list.ResourceBarrier(&[barrier]);
+    }
+    // The card holds the destination now: back into title memory after the list.
+    list.defer_gpu_write(&target, dst as usize, len);
+    let n = BUFFER_COPIES[0].fetch_add(1, Relaxed);
+    if n == 0 || n.is_power_of_two() && n >= 1024 {
+        tracing::info!(on_card = n + 1, on_cpu = BUFFER_COPIES[1].load(Relaxed), "title buffer copies run on the card (VICTORY_GPU_COPIES)");
+    }
+    true
+}
+
+/// Buffer to buffer: both are host memory, copied at submission (or on the
+/// card, [`gpu_copies`]).
 extern "system" fn copy_buffer_region(
     this: This,
     dst: This,
@@ -826,7 +940,10 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
-        list.defer_copy(to, from, len as usize);
+        if !gpu_copy(list, to, from, len as usize) {
+            BUFFER_COPIES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            list.defer_copy(to, from, len as usize);
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
@@ -910,7 +1027,11 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            let len = a.min(b) as usize;
+            if !gpu_copy(list, to, from, len) {
+                BUFFER_COPIES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                list.defer_copy(to, from, len);
+            }
         }
     }
     #[cfg(not(windows))]

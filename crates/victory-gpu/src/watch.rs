@@ -385,6 +385,36 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    query_writes(start, end, guarded, |_, now, pages| {
+        (now, pages.map(|(&p, &w)| (p, w)).collect())
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WriteSource {
+    Ahead,
+    Kernel,
+    Guard,
+}
+
+/// Textures need only one bit from the journal, whatever the size of the
+/// texture. Physical views still need the periodic hash for aliased writes.
+pub(crate) fn texture_writes(start: usize, end: usize, guarded: bool, since: u64) -> Option<(WriteSource, u64, bool)> {
+    query_writes(start, end, guarded, |source, now, mut pages| {
+        #[cfg(feature = "diagnostics")]
+        TEXTURE_QUERIES[source as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (source, now, since == 0 || pages.any(|(_, &when)| when > since))
+    })
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) static TEXTURE_QUERIES: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+fn query_writes<T>(
+    start: usize, end: usize, guarded: bool,
+    answer: impl FnOnce(WriteSource, u64, std::collections::btree_map::Range<'_, usize, u64>) -> T,
+) -> Option<T> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -392,13 +422,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((
-            j.ahead_asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
+        return Some(answer(WriteSource::Ahead, j.ahead_asked, j.written.range(first..last)));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -461,13 +485,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    let source = if failed { WriteSource::Guard } else { WriteSource::Kernel };
+    Some(answer(source, now, j.written.range(first..last)))
 }
 
 /// Diagnostics: one in 2,048 of the askings the kernel's write watch
@@ -1237,6 +1256,17 @@ mod tests {
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
         assert_eq!(again, [(p / PAGE + 1, now)]);
+        let (source, seen, dirty) = texture_writes(start, end, true, now).unwrap();
+        assert_eq!(source, WriteSource::Kernel);
+        assert!(!dirty);
+        // SAFETY: a second committed page of this test's allocation.
+        unsafe { ((p + 2 * PAGE + 8) as *mut u8).write_volatile(2) };
+        ask_ahead(&[(p, p + 2 * PAGE), (p + 2 * PAGE, end)]);
+        let answer = texture_writes(start, end, true, seen);
+        let next = answer.map(|(_, epoch, _)| texture_writes(start, end, true, epoch));
+        ask_ahead_done();
+        assert!(matches!(answer, Some((WriteSource::Ahead, _, true))));
+        assert!(matches!(next, Some(Some((WriteSource::Ahead, _, false)))));
         let mut plain = vec![0u8; PAGE];
         assert!(
             writes(
@@ -1433,6 +1463,10 @@ mod tests {
         assert!(is_view(p, p + 3 * BLOCK));
         assert_eq!(guard(p, p + 3 * BLOCK), Some(all));
         assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()), "nothing written since");
+        let (source, seen, first_read) = texture_writes(p, p + 3 * BLOCK, true, 0).unwrap();
+        assert_eq!(source, WriteSource::Guard);
+        assert!(first_read);
+        assert!(matches!(texture_writes(p, p + 3 * BLOCK, true, seen), Some((WriteSource::Guard, _, false))));
         // SAFETY: inside the mapped middle block.
         unsafe { ((p + BLOCK + 8) as *mut u8).write_volatile(1) };
         assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(1).collect()));

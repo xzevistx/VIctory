@@ -8,11 +8,9 @@
 //! buffer's descriptor from the program's table (a resource of the host,
 //! [`crate::resource::BvhNodes::Resource`]), and the title's way, a
 //! descriptor of numbers over title memory with the structure's address in
-//! the node pointer or in the descriptor. These tests have no host that
-//! keeps copies of title memory and their directory, so for the second
-//! they put a stand-in under the node reader
-//! (`lower::intersect::TEST_MEMORY`); without it the same program reads
-//! through the directory, which is only checked to lower and validate.
+//! the node pointer or in the descriptor. The broad arithmetic comparison
+//! uses a contiguous stand-in for title memory. The split-page test binds
+//! the production page directory and two separate GPU allocations.
 
 use super::host::{Dispatch, Host, Root, Stride, View};
 use super::lower::intersect::TEST_MEMORY;
@@ -188,6 +186,7 @@ fn build(
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        memory_stores: lowered.memory_stores,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -656,6 +655,68 @@ fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
         assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
         assert!(shader.root_uavs.contains(&super::SLOT_FAULTS));
     }
+}
+
+#[test]
+fn a_bvh4_node_split_between_two_gpu_pages_matches_the_reference() {
+    // The 128-byte box straddles a 64 KiB page boundary. A triangle lives
+    // on the second page. Different lanes take different handles in one wave.
+    const PAGE_BYTES: usize = 65536;
+    const BASE_ADDRESS: u64 = (3 * PAGE_BYTES - 64) as u64;
+    let mut scene = Scene::new();
+    let bounds = [
+        [-1.0, -1.0, 8.0, 1.0, 1.0, 9.0],
+        [-1.0, -1.0, 2.0, 1.0, 1.0, 3.0],
+        [4.0, -1.0, 2.0, 6.0, 1.0, 3.0],
+        [-1.0, -1.0, 5.0, 1.0, 1.0, 6.0],
+    ];
+    let box_node = scene.add(nodes::box32([13, 21, 29, 37], bounds), 32);
+    let triangle = scene.add(nodes::triangles(&[[-1.0, -1.0, 4.0], [1.0, -1.0, 4.0], [0.0, 1.0, 4.0]], 9), 16);
+    let forward = Ray::new([0.0; 3], [0.0, 0.0, 1.0], 20.0);
+    let aside = Ray::new([5.0, 0.0, 0.0], [0.0, 0.0, 1.0], 20.0);
+    let cases = [Some((box_node, 5, forward)), Some((triangle, 0, forward)),
+                 Some((box_node, 5, aside)), Some((triangle, 0, aside)), None];
+    assert_eq!(expected(&scene, &cases[0], true), [21, 37, 13, bvh::NONE]);
+    assert_eq!(expected(&scene, &cases[2], true), [29, bvh::NONE, bvh::NONE, bvh::NONE]);
+    let batch: Vec<_> = cases.into_iter().cycle().take(THREADS as usize).collect();
+    let records = buffer(&scene, &batch, BASE_ADDRESS);
+    let mut first = vec![0; PAGE_BYTES / 4];
+    first[PAGE_BYTES / 4 - 16..].copy_from_slice(&scene.words[..16]);
+    // Give page three a non-zero byte offset in its host allocation.
+    let mut second = vec![0xdead_beef; 8];
+    second.extend_from_slice(&scene.words[16..]);
+    let directory = vec![0, 0, 0, 0, 2, 0, 1, 32];
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut devices = 0;
+    for (label, warp) in [("hardware", false), ("WARP", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        for wide in [false, true] {
+            let (shader, _) = build(wide, WHOLE).expect("production page-directory shader");
+            assert_eq!(shader.root_uavs.as_slice(), &[super::SLOT_FAULTS]);
+            assert_eq!(shader.root_srvs.as_slice(), &[super::SLOT_MEMORY]);
+            let mut constants = vec![0; shader.user_data_dwords() as usize];
+            let base = shader.user_data.iter().find(|u| u.root == RootType::Other(super::USER_MEMORY_BASE)).unwrap();
+            constants[base.index as usize] = 2;
+            let (root, pso) = host.compute_pipeline(&shader).expect("create BVH4 pipeline");
+            let output = host.dispatch(&root, &pso, &Dispatch {
+                roots: vec![(0, Root::Constants(constants)), (1, Root::Uav(4)),
+                            (2, Root::View { srv: true, data: directory.clone() })],
+                views: &[View::Buffer { data: &records[..(NODES / 4) as usize], stride: Stride::Raw },
+                         View::RawUav(4 * THREADS), View::RawUav(64),
+                         View::RawUavData(&second), View::RawUavData(&first),
+                         View::RawUav(super::MEMORY_FAULTS)],
+                samplers: &[], groups: [1, 1, 1],
+            }).expect("dispatch BVH4 pipeline");
+            for (lane, case) in batch.iter().enumerate() {
+                assert_eq!(output[0][4 * lane..4 * lane + 4], expected(&scene, case, true),
+                           "{label}, wide pointer {wide}, lane {lane}");
+            }
+            assert!(output[4][1..].iter().all(|&page| page == 0), "unexpected page fault on {label}");
+        }
+        devices += 1;
+        eprintln!("{label}: both BVH4 pointer widths matched across split GPU pages");
+    }
+    assert!(devices > 0, "no shader model 6.6 device");
 }
 
 #[test]

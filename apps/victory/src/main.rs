@@ -67,6 +67,15 @@ enum Command {
         #[arg(long)]
         disasm: bool,
     },
+    /// Find the containers (files, archives) holding any of the given byte
+    /// strings (hex), in their own bytes or their unpacked native code:
+    /// which container a precompiled pipeline's stage hash or code is from.
+    ShaderFind {
+        paths: Vec<PathBuf>,
+        /// Hex byte strings to look for.
+        #[arg(long = "hex", required = true)]
+        needles: Vec<String>,
+    },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
     Translate {
@@ -91,6 +100,17 @@ enum Command {
         /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
         #[arg(long)]
         warm: Option<PathBuf>,
+    },
+    /// Translate the shaders of a title's archives into the cache and make
+    /// their compute pipelines, so that a run finds them there.
+    Warm {
+        paths: Vec<PathBuf>,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Only translate: no host pipelines.
+        #[arg(long)]
+        no_pipelines: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -148,6 +168,7 @@ fn main() -> Result<()> {
             missing,
         } => census::run(paths, strict, missing),
         Command::LibExports { lib, list } => inspect::lib_exports(&lib, list),
+        Command::ShaderFind { paths, needles } => shader::find(paths, &needles),
         Command::ShaderInfo {
             paths,
             verbose,
@@ -174,6 +195,7 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
+        Command::Warm { paths, jobs, no_pipelines } => translate::warm_archive(paths, jobs, !no_pipelines),
         Command::Run {
             exe,
             unimplemented,

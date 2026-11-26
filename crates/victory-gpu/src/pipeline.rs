@@ -61,6 +61,9 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// Its result gets the least indirect light ([`crate::ambient`]).
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Whether its code walks the ray-tracing structures, once looked at
@@ -101,6 +104,13 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
+/// Whether a container is the program that resolves the indirect diffuse
+/// light ([`crate::ambient::PROGRAM`], by its name inside the container).
+#[cfg(windows)]
+fn resolves_light(bytes: &[u8]) -> bool {
+    bytes.windows(crate::ambient::PROGRAM.len()).any(|w| w == crate::ambient::PROGRAM)
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
@@ -116,12 +126,35 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
+                resolves_light: resolves_light(bytes),
+                #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
             })
         })
         .clone()
+}
+
+/// Puts the translation of a container of the title's into the cache on
+/// disk, and with `compute` its host pipeline into the driver's, before any
+/// run wants them. Whether it translated, and whether it has a pipeline
+/// (`None`: not asked for, or left out).
+#[cfg(windows)]
+pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Option<bool>) {
+    let full = blake3::hash(container);
+    // Not through the table, which lets nothing go.
+    let shader = Arc::new(Shader {
+        stage,
+        hash: full.to_hex()[..16].to_owned(),
+        container: container.to_vec(),
+        resolves_light: resolves_light(container),
+        translated: OnceLock::new(),
+        walks: OnceLock::new(),
+    });
+    let translated = shader.translated().is_some();
+    let made = (translated && compute).then(|| make::warm(vec![shader])).flatten();
+    (translated, made)
 }
 
 /// A translated shader and the console resources its code reads.
@@ -481,6 +514,20 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// As [`host_pipeline`], for draws of the console's rectangles
+/// ([`make::ready_rects`]).
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(this: This, rects: bool) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    if rects {
+        make::ready_rects(&pipeline(this).host)
+    } else {
+        make::ready(&pipeline(this).host)
+    }
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
@@ -513,11 +560,38 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// The pixel shaders of the title's wet weathering passes
+/// (`PS_TiledWeathering*_WET*`, both builds of each): left out unless
+/// `VICTORY_WET_WEATHERING=1`. The tiles they shade are marked wet indoors
+/// and dry, skin included: faces and arms showed sharp glossy streaks and
+/// sparkles under neon and police lights, and dry walls blue-white smears
+/// (runs glow-hold2-* and shots-b-*); without them (run no-wet-*) skin and
+/// walls are matte. shortcut: what marks the tiles wet is not found yet;
+/// rain and puddles are dry meanwhile.
+#[cfg(all(windows, feature = "diagnostics"))]
+const WET_WEATHERING: &str = concat!(
+    "bd768869e6a9bbb9,", "6c21bcbcc3416dce,", "9507e549b138f78a,", "1f8ed9edbc018811,", "75165dea28997f64,", "979be1a39ef9a780,",
+    "1d19dead161179e0,", "45d9fb41a3f091ad,", "f5631d02141ccf4a,", "32dafebdbfabac96,", "2c42f1061b991556,", "b9e4d3aab6a1b39c,",
+    "268d3bd5a97bc55a,", "5d31abc11729b4b8,", "4c3f209401b1c561,", "b00e9c5ddc9b19f6,", "79ee054eed4ef0f2,", "dd44029cb5188179,",
+    "a03a5b004229d736,", "7e790dc9978e728b,", "b7eb97debe7f232f,", "51b6604981878b6e,", "edef484af6e06ecd,", "276095b0008866b5,",
+    "37849edc52ccf0e0,", "09872d838262a1b2,", "cd494288f1a8e1c0,", "635fb84587970774,", "0fc6cbeb2f7104f6,", "424d7d00f2d6f528,",
+    "7c7b0727a2a9363b,", "2896307ec3d5a1fd,", "c63d5562b559c111,", "4ef7f52b61ea7cb6,", "b8ae4f188396efe2,", "afee430d360e8b8c,",
+    "9e34f46bca161e5f,", "33076f25f1436137,", "78ec1a6cca5c6b60,", "6663f768dce77155,", "3ff205fd9ea10c68,", "c4c70b24fb9a9e6f,",
+    "9ada5cf01caffc72,", "5ed78af77dc3f3e2,", "fa3534fe1e406e51,", "766d52cd7d614053,", "17b5286d402a7c0c,", "94f4fdd63217f833,",
+    "6e3dd0a722db7fbd,", "91980dc12cb0969a,", "40deac5fc988f351,", "1870bb9633c30fc4,", "3fc3a49cf5294684,", "18fa17c244b1043b,",
+    "b77c96c8aa1687eb,", "c7b9d33d04ce489f,", "b986f4edd4ed5e53,", "32b625e06f106d8c,", "94268e8eff4dc1a2,", "6cab7f93bd2f57b1,",
+    "7b5e713a559fc728,", "220fcfc4973cd801,", "7af9b426673ce896,", "cb8af919d9e2512c,",
+);
+
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
-        let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
+        let mut value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
+        if std::env::var_os("VICTORY_WET_WEATHERING").is_none_or(|v| v != "1") {
+            value.push(',');
+            value.push_str(WET_WEATHERING);
+        }
         parse_skip_hashes(&value)
     });
     if hashes.is_empty() {
@@ -532,6 +606,15 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
+}
+
+/// `VICTORY_WATCH_SHADER=<hash>[,<hash>...]`: whether the pipeline `this` runs one of those
+/// shaders, whose draws `draw.rs` then describes in the log (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn is_watched(this: This) -> bool {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    let hashes = HASHES.get_or_init(|| parse_skip_hashes(&std::env::var("VICTORY_WATCH_SHADER").unwrap_or_default()));
+    !hashes.is_empty() && !this.is_null() && pipeline(this).shaders.iter().any(|s| hashes.contains(&s.hash))
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
@@ -579,6 +662,95 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
     Some(shader(stage, unsafe {
         std::slice::from_raw_parts(code.code, code.size)
     }))
+}
+
+/// Finds the title's shader containers by their stage hash (the 16 bytes of
+/// a container's `XDAT` entry of kind 0x10): for each hash asked, the
+/// container, or `None`. Set by the runner, which reads the title's shader
+/// archive (the archive stays packed; containers are unpacked as asked).
+pub type ContainerFinder = dyn Fn(&[[u8; 16]]) -> Vec<Option<Vec<u8>>> + Send + Sync;
+static FINDER: OnceLock<Box<ContainerFinder>> = OnceLock::new();
+
+/// See [`ContainerFinder`].
+pub fn set_container_finder(finder: Box<ContainerFinder>) {
+    let _ = FINDER.set(finder);
+}
+
+/// The stage a container's native program runs as, for [`shader`].
+fn stage_of(container: &[u8]) -> Option<&'static str> {
+    use victory_shader::{Container, FourCC, HwStage, native_programs};
+    let c = Container::parse(container).ok()?;
+    let programs = native_programs(c.part(FourCC::DXIL)?.data).ok()?;
+    programs.iter().find_map(|p| match p.stage {
+        HwStage::Vs => Some("vertex"),
+        HwStage::Ps => Some("pixel"),
+        HwStage::Ms => Some("mesh"),
+        HwStage::Cs => Some("compute"),
+        _ => None,
+    })
+}
+
+/// A pipeline the console's driver had compiled ahead (device methods
+/// 0x1c8 and 0x218): made from the title's own containers of the stages it
+/// names by hash, as if the title had passed those. `None` when a stage is
+/// not found (the caller then refuses the call, as before).
+pub(crate) fn create_precompiled(
+    hashes: &[[u8; 16]],
+    blocks: Option<(&[u8], &[u8])>,
+    iid: *const Iid,
+    out: *mut This,
+) -> Option<HRESULT> {
+    let finder = FINDER.get()?;
+    let found = finder(hashes);
+    let mut stages: Vec<(&'static str, Vec<u8>)> = Vec::new();
+    for container in found {
+        let container = container?;
+        stages.push((stage_of(&container)?, container));
+    }
+    // A compute stage beside a mesh stage is its amplification stage.
+    if stages.iter().any(|s| s.0 == "mesh") {
+        for s in &mut stages {
+            if s.0 == "compute" {
+                s.0 = "amplification";
+            }
+        }
+    }
+    const ORDER: [&str; 5] = ["amplification", "mesh", "vertex", "pixel", "compute"];
+    stages.sort_by_key(|s| ORDER.iter().position(|o| *o == s.0));
+    let compute = stages.iter().all(|s| s.0 == "compute");
+    // A draw pipeline needs its vertex or mesh stage and its state.
+    #[cfg(windows)]
+    let graphics = if compute {
+        None
+    } else {
+        if !stages.iter().any(|s| s.0 == "vertex" || s.0 == "mesh") {
+            return None;
+        }
+        let (state, layout) = blocks?;
+        let g = host::GraphicsState::from_console(state, layout)?;
+        #[cfg(feature = "diagnostics")]
+        if std::env::var_os("VICTORY_PRECOMPILED_LOG").is_some_and(|v| v == "1") {
+            let hex = |b: &[u8]| b.chunks(4).map(|w| format!("{:08x}", u32::from_le_bytes(w.try_into().unwrap_or_default()))).collect::<Vec<_>>().join(" ");
+            tracing::info!(
+                stages = ?stages.iter().map(|s| (s.0, blake3::hash(&s.1).to_hex()[..16].to_owned())).collect::<Vec<_>>(),
+                state_block = hex(state),
+                layout_block = hex(layout),
+                "precompiled pipeline state: {}",
+                g.describe()
+            );
+        }
+        Some(Box::new(g))
+    };
+    #[cfg(not(windows))]
+    let _ = (compute, blocks);
+    let shaders = stages.iter().map(|(stage, bytes)| shader(stage, bytes)).collect();
+    Some(hand_out(
+        shaders,
+        #[cfg(windows)]
+        graphics,
+        iid,
+        out,
+    ))
 }
 
 fn hand_out(

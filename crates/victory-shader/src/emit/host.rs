@@ -600,12 +600,15 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
         root_indexed_views: Vec::new(),
+        memory_stores: false,
     }
 }
 
 /// A root argument for [`Host::draw`].
 #[cfg(test)]
 pub enum Root {
+    /// Use a dispatch output buffer as a root UAV, by its readback index.
+    Uav(usize),
     Constants(Vec<u32>),
     /// A table starting at this heap index.
     Table {
@@ -855,7 +858,7 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -986,6 +989,8 @@ pub enum View<'a> {
     Cube(u32, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
+    /// A raw UAV with known contents at the start of the dispatch.
+    RawUavData(&'a [u32]),
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
@@ -1224,7 +1229,7 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
+                    View::RawUav(_) | View::RawUavData(_) | View::HalfUav(_) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
@@ -1236,6 +1241,10 @@ impl Host {
                             View::RawUav(n) => {
                                 (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
                             }
+                            View::RawUavData(data) => {
+                                let n = u32::try_from(data.len()).map_err(|_| "raw UAV is too large")?;
+                                (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
+                            }
                             _ => unreachable!(),
                         };
                         let bytes = u64::from(n) * 4;
@@ -1244,6 +1253,14 @@ impl Host {
                             &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
                             D3D12_RESOURCE_STATE_COMMON,
                         )?;
+                        if let View::RawUavData(data) = *v {
+                            let source = upload(data)?;
+                            list.CopyBufferRegion(&b, 0, &source, 0, bytes);
+                            list.ResourceBarrier(&[transition(
+                                &b, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            )]);
+                            keep.push(source);
+                        }
                         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
                             Format: format,
                             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
@@ -1379,6 +1396,13 @@ impl Host {
                         let mut at = h.GetGPUDescriptorHandleForHeapStart();
                         at.ptr += (index * size) as u64;
                         list.SetComputeRootDescriptorTable(*param, at);
+                    }
+                    Root::Uav(index) => {
+                        let (buffer, shape, _, _) = uavs.get(*index).ok_or("root UAV index out of range")?;
+                        if shape.is_some() {
+                            return Err("root UAV must be a buffer".into());
+                        }
+                        list.SetComputeRootUnorderedAccessView(*param, buffer.GetGPUVirtualAddress());
                     }
                     Root::View { srv, data } => {
                         let b = upload(data)?;

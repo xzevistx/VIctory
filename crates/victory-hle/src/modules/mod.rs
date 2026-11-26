@@ -11,11 +11,15 @@
 #[cfg(windows)]
 pub mod apu;
 pub mod audio;
+#[cfg(windows)]
+pub mod bvh;
 pub mod d3d12x;
 pub mod display;
 pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
+#[cfg(windows)]
+pub mod ffx;
 #[cfg(windows)]
 pub mod files;
 pub mod gameinput;
@@ -70,5 +74,9 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
+    #[cfg(windows)]
+    all.push(bvh::module());
+    #[cfg(windows)]
+    all.push(ffx::module());
     all
 }

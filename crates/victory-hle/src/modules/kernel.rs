@@ -153,7 +153,9 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         module
     };
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
-        return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
+        return watched_title_export(module, name)
+            .or_else(|| host_override(module, name))
+            .unwrap_or_else(|| host::get_proc_address(module, name));
     };
     // Values below 0x10000 are ordinals; we export by name only.
     if (name as usize) < 0x1_0000 {
@@ -173,6 +175,25 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
             std::ptr::null_mut()
         }
     }
+}
+
+/// A title DLL's function the registry serves in its place (a watch that
+/// calls through to it: `modules::ffx`, `modules::bvh`), for a title that
+/// looks it up by name rather than importing it.
+fn watched_title_export(module: *mut c_void, name: *const u8) -> Option<*mut c_void> {
+    if module.is_null() || (name as usize) < 0x1_0000 {
+        return None;
+    }
+    let path = runtime::image_path(module as usize)?;
+    let file = path.file_name()?.to_string_lossy().into_owned();
+    let symbol = narrow(name);
+    if file.to_ascii_lowercase().contains("fidelityfx") || file.eq_ignore_ascii_case("XboxBvhBuilder.dll") {
+        static SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 64 {
+            tracing::info!(%file, %symbol, "GetProcAddress of a title DLL");
+        }
+    }
+    crate::registry::lookup(&file, &symbol).map(|address| address as *mut c_void)
 }
 
 /// What a host module's `name` (or ordinal) is bound to at import binding

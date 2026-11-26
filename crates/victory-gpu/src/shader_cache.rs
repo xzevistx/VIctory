@@ -246,6 +246,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    word(&mut out, u32::from(s.memory_stores));
     out
 }
 
@@ -314,6 +315,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let memory_stores = r.word()? != 0;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -324,6 +326,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
+        memory_stores,
     })
 }
 
@@ -358,6 +361,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            memory_stores: true,
         }
     }
 

@@ -2888,6 +2888,8 @@ impl Shadow {
         if !crate::inplace::back_own() {
             return false;
         }
+        #[cfg(feature = "diagnostics")]
+        crate::memory::trace::check_ones(at, bytes, (self.start, self.len, self.window));
         let Some(shown) = crate::inplace::write_own(at, bytes) else {
             OWN_WRITES[3].fetch_add(1, Ordering::Relaxed);
             return false;

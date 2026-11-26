@@ -1825,13 +1825,12 @@ void main() {
         );
         assert_eq!(after_src, initial_src, "src_args must remain untouched");
 
-        let mut kept = 0usize;
+        let mut kept = Vec::new();
         let mut zeroed = 0usize;
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
             if rec[0] == (1 << 22) && rec[1] == 16 {
-                assert!(i == 1 || i == 2, "the first two real draws fit the budget");
-                kept += 1;
+                kept.push(i);
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
                 zeroed += 1;
@@ -1841,7 +1840,10 @@ void main() {
             assert_eq!(rec[4], 5000 + i as u32);
             assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
         }
-        assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+        // Either 64-thread group can win the atomic budget reservation.
+        // Within that group the first two real records must be preserved.
+        assert!(kept == [1, 2] || kept == [64, 65], "unexpected winning records: {kept:?}");
+        assert_eq!(zeroed, (RECORDS as usize) - 2);
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, the scratch buffer's

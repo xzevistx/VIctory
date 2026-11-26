@@ -575,14 +575,82 @@ impl Layout {
             + u64::from(self.pattern[0][(x % bw) as usize])
     }
 
+    /// What a detile on the card needs for depth slice `z` of the
+    /// subresource of mip `mip` and array slice `slice` (3D: `slice` 0, `z`
+    /// below the mip's depth): its base, and per row and per column the
+    /// part of the tiled offsets that row or column gives, so that element
+    /// (x, y) lies at `base + rows[y] + columns[x]`, as [`Layout::detile`]
+    /// copies it.
+    pub fn tables(&self, mip: u32, slice: u32, z: u32) -> Result<(u64, Vec<u32>, Vec<u32>), Error> {
+        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let first = if self.desc.dimension == Dimension::Tex3d {
+            if slice != 0 || z >= m.depth {
+                return Err(Error::Invalid);
+            }
+            z
+        } else {
+            if z != 0 {
+                return Err(Error::Invalid);
+            }
+            slice
+        };
+        let (s, inner) = self.split(first);
+        if s >= self.slices {
+            return Err(Error::Invalid);
+        }
+        if !self.addressable() {
+            return Err(Error::Unsupported);
+        }
+        let n = u64::from(self.desc.element_bytes);
+        let base = u64::from(s) * self.slice_size + m.offset;
+        let fits = |v: u64| u32::try_from(v).map_err(|_| Error::Invalid);
+        let (rows, columns) = if self.desc.swizzle == Swizzle::LINEAR {
+            let rows = (0..m.height).map(|y| fits(u64::from(y) * u64::from(m.pitch) * n)).collect::<Result<_, _>>()?;
+            let columns = (0..m.width).map(|x| fits(u64::from(x) * n)).collect::<Result<_, _>>()?;
+            (rows, columns)
+        } else {
+            let rows = (0..m.height).map(|y| fits(self.row(m, y, inner))).collect::<Result<_, _>>()?;
+            let columns = (0..m.width).map(|x| fits(self.column(m, x))).collect::<Result<_, _>>()?;
+            (rows, columns)
+        };
+        Ok((base, rows, columns))
+    }
+
     /// Depth slices a subresource of mip `mip` covers: the mip's depth for
     /// 3D textures, else 1 (one array slice).
     pub fn subresource_depth(&self, mip: u32) -> u32 {
         self.mips.get(mip as usize).map_or(0, |m| m.depth)
     }
 
+    /// The bytes from the texture's start that mip `first` and the smaller
+    /// ones take: the smaller a mip, the nearer the start it lies, so a
+    /// title that streams textures has memory for the smaller mips only and
+    /// another texture right behind them. All of the layout where slices
+    /// follow each other (each holds its whole chain).
+    pub fn bytes_from(&self, first: u32) -> u64 {
+        let whole = first == 0
+            || self.slices != 1
+            || self.thick
+            || self.desc.dimension == Dimension::Tex3d
+            || self.desc.samples != 1
+            || first >= self.desc.mips;
+        if whole {
+            return self.size;
+        }
+        self.mips[first as usize..]
+            .iter()
+            .map(|m| match m.tail {
+                Some(_) => self.alignment,
+                None => m.offset + u64::from(m.pitch) * u64::from(m.rows) * u64::from(self.desc.element_bytes),
+            })
+            .max()
+            .unwrap_or(self.size)
+            .min(self.size)
+    }
+
     /// Copies one subresource out of tiled memory (the whole texture,
-    /// [`Layout::size`] bytes) into linear rows: mip `mip` of array slice
+    /// [`Layout::size`] bytes, or the [`Layout::bytes_from`] of the mip)
+    /// into linear rows: mip `mip` of array slice
     /// `slice` (3D: every depth slice of the mip, `slice` 0). Rows are
     /// `row_pitch` bytes apart, depth slices `depth_pitch`.
     pub fn detile(
@@ -650,7 +718,7 @@ impl Layout {
         } else {
             (dst.len(), src.len())
         };
-        if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
+        if tiled_len < self.bytes_from(mip) as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
@@ -894,6 +962,76 @@ mod tests {
         }
     }
 
+    /// What [`Layout::tables`] gives for every mip, array slice and depth
+    /// slice puts each element where [`Layout::detile`] does: the card's
+    /// detile (`victory-gpu` `gpudetile`) copies by these tables.
+    #[test]
+    fn tables_place_every_element_as_detile_does() {
+        let modes = [
+            Swizzle::LINEAR,
+            Swizzle::SW_4KB_S,
+            Swizzle::SW_64KB_S,
+            Swizzle::SW_64KB_D,
+            Swizzle::SW_64KB_S_X,
+            Swizzle::SW_64KB_D_X,
+            Swizzle::SW_64KB_Z_X,
+            Swizzle::SW_64KB_R_X,
+        ];
+        let mut seed = 0x9e37_79b9_u32;
+        let mut checked = 0;
+        for swizzle in modes {
+            for bpe in [1, 2, 4, 8, 16] {
+                for (w, h, depth, mips, dimension) in [
+                    (37, 23, 1, 6, Dimension::Tex2d),
+                    (256, 128, 3, 9, Dimension::Tex2d),
+                    (33, 17, 9, 5, Dimension::Tex3d),
+                ] {
+                    let mut d = desc(w, h, mips, bpe, swizzle);
+                    d.depth = depth;
+                    d.dimension = dimension;
+                    let Ok(layout) = Layout::new(&d) else { continue };
+                    if !layout.addressable() {
+                        continue;
+                    }
+                    let tiled: Vec<u8> = (0..layout.size)
+                        .map(|_| {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 17;
+                            seed ^= seed << 5;
+                            seed as u8
+                        })
+                        .collect();
+                    let slices = if dimension == Dimension::Tex3d { 1 } else { depth };
+                    for mip in 0..mips {
+                        let m = layout.mips[mip as usize];
+                        let n = bpe as usize;
+                        let pitch = m.width as usize * n;
+                        let depth_pitch = pitch * m.height as usize;
+                        for slice in 0..slices {
+                            let mut want = vec![0u8; depth_pitch * m.depth as usize];
+                            layout.detile(&tiled, mip, slice, &mut want, pitch, depth_pitch).unwrap();
+                            let mut got = vec![0u8; want.len()];
+                            let zs = if dimension == Dimension::Tex3d { m.depth } else { 1 };
+                            for z in 0..zs {
+                                let (base, rows, columns) = layout.tables(mip, slice, z).unwrap();
+                                for (y, row) in rows.iter().enumerate() {
+                                    for (x, column) in columns.iter().enumerate() {
+                                        let from = (base + u64::from(*row) + u64::from(*column)) as usize;
+                                        let to = z as usize * depth_pitch + y * pitch + x * n;
+                                        got[to..to + n].copy_from_slice(&tiled[from..from + n]);
+                                    }
+                                }
+                            }
+                            assert!(got == want, "{swizzle:?} bpe {bpe} {w}x{h}x{depth} {dimension:?} mip {mip} slice {slice}");
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 100, "only {checked} subresources checked");
+    }
+
     /// Sizes past the hardware's 16384 texels per side are refused instead
     /// of overflowing the size arithmetic (found by random-input testing).
     #[test]
@@ -1100,6 +1238,34 @@ mod tests {
         assert_eq!(l.mips[2].offset, 4096);
         assert_eq!(l.mips[1].offset, 8192);
         assert_eq!(l.mips[0].offset, 8192 + 16384);
+    }
+
+    /// The smaller mips lie first: they are read from the memory that holds
+    /// them alone, as from the whole texture's.
+    #[test]
+    fn smaller_mips_need_only_the_start_of_the_texture() {
+        // 1024x1024 BC1 (8-byte elements) in 4 KiB blocks: the tail (from
+        // 64x64 on), then 128x128 in two blocks, 256x256 in eight.
+        let l = Layout::new(&Desc { block: 4, ..desc(1024, 1024, 9, 8, Swizzle::SW_4KB_S) }).unwrap();
+        assert_eq!(l.bytes_from(0), l.size);
+        let needs: Vec<u64> = (0..9).map(|mip| l.bytes_from(mip)).collect();
+        assert!(needs.windows(2).all(|w| w[0] >= w[1]), "{needs:?}");
+        assert_eq!((l.bytes_from(4), l.bytes_from(8)), (4096, 4096));
+        let tiled: Vec<u8> = (0..l.size).map(|i| (i * 7 >> 3) as u8).collect();
+        for mip in 1..9 {
+            let m = l.mips[mip as usize];
+            let pitch = m.width as usize * 8;
+            let read = |tiled: &[u8]| {
+                let mut linear = vec![0; pitch * m.height as usize];
+                l.detile(tiled, mip, 0, &mut linear, pitch, pitch * m.height as usize).map(|()| linear)
+            };
+            let len = l.bytes_from(mip) as usize;
+            assert_eq!(read(&tiled[..len]), read(&tiled));
+            assert_eq!(read(&tiled[..len - 1]), Err(Error::TooSmall));
+        }
+        // Slices each hold their chain: the whole texture.
+        let l = Layout::new(&Desc { depth: 2, block: 4, ..desc(1024, 1024, 9, 8, Swizzle::SW_4KB_S) }).unwrap();
+        assert_eq!(l.bytes_from(4), l.size);
     }
 
     #[test]

@@ -130,6 +130,15 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// 4K screen is about 10^13 iterations); a much lower limit shows whether
 /// such loops are what makes a frame slow. The value is part of the
 /// translation, so the shader cache must key on it (`victory-gpu`'s does).
+/// `VICTORY_STORE_TRACE=1` (diagnostics builds): every store and atomic
+/// through a raw title address also leaves its page in the fault notes,
+/// with the top bit set, so the host can tell which pages a dispatch
+/// wrote (`victory_gpu::memory::trace`).
+pub fn store_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_STORE_TRACE").is_some_and(|v| v == "1"))
+}
+
 pub fn loop_limit() -> u32 {
     static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
@@ -266,6 +275,9 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// Whether it stores to title memory through raw addresses: only then
+    /// may the host take the copies it reaches that way as written.
+    pub memory_stores: bool,
 }
 
 impl HostShader {
@@ -397,12 +409,18 @@ pub fn emit(
         // The program in two other forms: without its early-outs, and
         // without any branch that only skips code no lane is left for.
         let form = |p: Option<ir::Program>| {
-            p.and_then(|p| {
-                let st = structure::structure(&p).ok()?;
-                let io = io::raise(&p, native).ok()?;
-                let res = resource::track(&p, &native.layout, native.stage, Some(&st)).ok()?;
-                Some((p, st, io, res))
-            })
+            let Some(p) = p else {
+                if why {
+                    eprintln!("WAVE64-FORM not made");
+                }
+                return None;
+            };
+            let st = structure::structure(&p).map_err(|e| why.then(|| eprintln!("WAVE64-FORM structure: {e}"))).ok()?;
+            let io = io::raise(&p, native).map_err(|e| why.then(|| eprintln!("WAVE64-FORM I/O: {e}"))).ok()?;
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st))
+                .map_err(|e| why.then(|| eprintln!("WAVE64-FORM resources: {e}")))
+                .ok()?;
+            Some((p, st, io, res))
         };
         let forms = [
             ("without early-outs", form(ir::without_early_outs(p))),
@@ -504,6 +522,29 @@ pub fn emit(
                 }
             }
         }
+        // Last of all, for a program that would otherwise be refused (a 32-lane card has no
+        // 64-lane waves): the wave-wide branches even with `VICTORY_WAVE_WIDE` unset. Only
+        // programs that reach here take them, so the ones of runs 121-124, which translate in
+        // the forms above, never do. Another build ran `369cbe906ea72764` and
+        // `2cc4c197ee29e291` this way through two world runs with the card kept.
+        // `VICTORY_WAVE_WIDE_LAST=0` turns it off.
+        let last_on = std::env::var_os("VICTORY_WAVE_WIDE_LAST").is_none_or(|v| v != "0");
+        if !wide_on && last_on {
+            let deep = form(ir::without_skips(p, true));
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches, last resort", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
@@ -560,6 +601,12 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        // Several console waves: their wave-wide branches are decided for the whole group
+        // (`lower` `group_wide`), so no barrier waits for a wave that went elsewhere.
+        // `VICTORY_WAVE_WIDE_GROUPS=0` refuses them as before.
+        crate::native::StageIo::Cs(cs)
+            if cs.threads.iter().product::<u32>().is_multiple_of(64)
+                && std::env::var_os("VICTORY_WAVE_WIDE_GROUPS").is_none_or(|v| v != "0") => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -701,6 +748,7 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        memory_stores: l.memory_stores,
     };
     Ok((shader, wave_size))
 }
@@ -1076,6 +1124,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            memory_stores: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1088,6 +1137,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                memory_stores: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -1377,6 +1427,7 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
+                memory_stores: false,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [

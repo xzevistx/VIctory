@@ -364,10 +364,113 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
 ) -> HRESULT {
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+    static MADE: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
     let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
+    }
+    // The description is the root signature, then (pointer, size) pairs:
+    // render state, input layout, and per stage its code (already in GPU
+    // memory, relocated) and a table of 8-dword entries after a 4-dword
+    // head, whose entry of type 0x43 holds the stage's 16-byte hash. The
+    // hash names the title's own container of that stage (its `XDAT` kind
+    // 0x10 entry), which is translated as usual.
+    // Both blocks are decoded (`GraphicsState::from_console`: formats,
+    // input layout, depth, stencil, blending, culling, depth clip and
+    // bias). shortcut: still behind `VICTORY_PRECOMPILED=1`: in the merged
+    // build the opening went black with it and the ambient module both on
+    // (run `next-first-*`), and the two were not told apart.
+    #[cfg(windows)]
+    if std::env::var_os("VICTORY_PRECOMPILED").is_some_and(|v| v == "1") {
+        let mut hashes: Vec<[u8; 16]> = Vec::new();
+        let mut blocks: Vec<Vec<u8>> = Vec::new();
+        let mut words = [0u8; 128];
+        if !desc.is_null() && crate::host::read_into(desc, &mut words) {
+            let word = |i: usize| u64::from_le_bytes(words[8 * i..8 * i + 8].try_into().unwrap_or_default());
+            for i in 1..15 {
+                let (at, len) = (word(i) as usize, word(i + 1) as usize);
+                if at <= 0x10000 || !(0x24..=0x2000).contains(&len) {
+                    continue;
+                }
+                let mut block = vec![0u8; len];
+                if !crate::host::read_into(at as *const u8, &mut block) {
+                    continue;
+                }
+                // The render state and the formats and input layout: the
+                // first two blocks.
+                if i <= 3 && i % 2 == 1 {
+                    blocks.push(block.clone());
+                }
+                let dwords: Vec<u32> = block
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_le_bytes(*b))
+                    .collect();
+                let mut e = 4;
+                while e + 5 <= dwords.len() {
+                    if dwords[e] == 0x43 {
+                        let mut h = [0u8; 16];
+                        for k in 0..4 {
+                            h[4 * k..4 * k + 4].copy_from_slice(&dwords[e + 1 + k].to_le_bytes());
+                        }
+                        if !hashes.contains(&h) {
+                            hashes.push(h);
+                        }
+                    }
+                    e += 8;
+                }
+            }
+        }
+        // `VICTORY_PRECOMPILED_RANGE=lo-hi` (diagnostics): only the distinct
+        // precompiled pipelines numbered lo..hi in the order first seen are
+        // made, to find one that ends the run.
+        #[cfg(feature = "diagnostics")]
+        let allowed = {
+            static SEEN: std::sync::Mutex<Vec<Vec<[u8; 16]>>> = std::sync::Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            let index = match seen.iter().position(|h| *h == hashes) {
+                Some(i) => i,
+                None => {
+                    seen.push(hashes.clone());
+                    let hex: Vec<String> = hashes.iter().map(|h| h.iter().map(|b| format!("{b:02x}")).collect()).collect();
+                    tracing::info!(index = seen.len() - 1, slot = format_args!("{:#x}", SLOT), "precompiled pipeline first seen: {hex:?}");
+                    seen.len() - 1
+                }
+            };
+            std::env::var("VICTORY_PRECOMPILED_RANGE")
+                .ok()
+                .and_then(|r| {
+                    let (lo, hi) = r.split_once('-')?;
+                    Some((lo.trim().parse::<usize>().ok()?, hi.trim().parse::<usize>().ok()?))
+                })
+                .is_none_or(|(lo, hi)| (lo..hi).contains(&index))
+        };
+        #[cfg(not(feature = "diagnostics"))]
+        let allowed = true;
+        if !hashes.is_empty()
+            && allowed
+            && let Some(hr) = crate::pipeline::create_precompiled(
+                &hashes,
+                (blocks.len() >= 2 && (0x17c..=0x190).contains(&blocks[0].len()))
+                    .then(|| (blocks[0].as_slice(), blocks[1].as_slice())),
+                _iid,
+                out,
+            )
+        {
+            let made = MADE[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
+            if made <= 4 || made.is_power_of_two() {
+                tracing::info!(
+                    slot = format_args!("{:#x}", SLOT),
+                    made,
+                    stages = hashes.len(),
+                    hr = format_args!("{:#x}", hr),
+                    "a precompiled pipeline made from the title's own shaders, found by their hashes"
+                );
+            }
+            return hr;
+        }
     }
     if calls <= 4 || calls.is_power_of_two() {
         // Sixteen 64-bit words at `at`, read through the kernel: neither
@@ -388,6 +491,31 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
+        // `VICTORY_PIPELINE_DUMP=<folder>` (diagnostics): the description
+        // and every (pointer, size) pair's bytes in it, to work out what
+        // the two methods are given.
+        #[cfg(all(windows, feature = "diagnostics"))]
+        if calls <= 48
+            && let Some(dir) = std::env::var_os("VICTORY_PIPELINE_DUMP")
+            && let Some(w) = &description
+        {
+            let dir = std::path::PathBuf::from(dir);
+            let _ = std::fs::create_dir_all(&dir);
+            let name = |what: &str| dir.join(format!("{SLOT:#x}-{calls}-{what}.bin"));
+            let mut raw = [0u8; 128];
+            if crate::host::read_into(desc as *const u8, &mut raw) {
+                let _ = std::fs::write(name("desc"), raw);
+            }
+            for (i, pair) in w.windows(2).enumerate() {
+                let (at, len) = (pair[0] as usize, pair[1] as usize);
+                if at > 0x10000 && (1..=1 << 20).contains(&len) {
+                    let mut bytes = vec![0u8; len];
+                    if crate::host::read_into(at as *const u8, &mut bytes) {
+                        let _ = std::fs::write(name(&format!("w{i}-{at:x}-{len:x}")), bytes);
+                    }
+                }
+            }
+        }
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,

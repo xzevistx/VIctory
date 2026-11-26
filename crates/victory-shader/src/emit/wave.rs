@@ -34,6 +34,9 @@ pub(crate) enum Op {
     Or,
     And,
     Xor,
+    /// A sum of doubles (`v_add_f64`), one dword of it: `high` the upper one; `other` the
+    /// lanes' other dword of the same double.
+    AddD { high: bool, other: Value },
 }
 
 impl Op {
@@ -60,7 +63,7 @@ impl Op {
     /// Whether `k` leaves the other operand unchanged.
     fn identity(self, k: u32) -> bool {
         match self {
-            Op::AddU | Op::AddH | Op::Or | Op::Xor | Op::MaxU => k == 0,
+            Op::AddU | Op::AddH | Op::Or | Op::Xor | Op::MaxU | Op::AddD { .. } => k == 0,
             Op::AddF => k == 0 || k == 0x8000_0000,
             Op::MinU | Op::And => k == u32::MAX,
             Op::MinI => k == 0x7FFF_FFFF,
@@ -72,7 +75,7 @@ impl Op {
 
     /// Counting a lane twice changes the result.
     fn counts(self) -> bool {
-        matches!(self, Op::AddU | Op::AddF | Op::AddH | Op::Xor)
+        matches!(self, Op::AddU | Op::AddF | Op::AddH | Op::Xor | Op::AddD { .. })
     }
 }
 
@@ -365,6 +368,67 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             }
         };
         let modifiers = v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some();
+        if name == "v_add_f64" {
+            // A sum of doubles: each operand a pair of dwords, a lane's two
+            // dwords the same reduction over the same lanes of its two
+            // halves; the result's dwords stay such a pair.
+            let half = |op: &Operand, k: u8| -> Operand {
+                match *op {
+                    Operand::Vector { reg, .. } => Operand::Vector { reg: reg + k, dwords: 1 },
+                    Operand::Scalar { code, .. } if code != NULL => Operand::Scalar { code: code + k, dwords: 1 },
+                    o => o,
+                }
+            };
+            let Some(Operand::Vector { reg: dreg, .. }) = v.dst else {
+                continue;
+            };
+            let (Some(a), Some(b)) = (v.src.first(), v.src.get(1)) else {
+                continue;
+            };
+            let (dlo, dhi) = (inst.write(Reg::V(dreg)), inst.write(Reg::V(dreg + 1)));
+            let unknown = || vec![Sym::Unknown; wave as usize];
+            let ok = !modifiers && v.dpp.is_none() && exec == all;
+            let (alo, ahi, blo, bhi) = (
+                lanes(&half(a, 0), &vec, &uni),
+                lanes(&half(a, 1), &vec, &uni),
+                lanes(&half(b, 0), &vec, &uni),
+                lanes(&half(b, 1), &vec, &uni),
+            );
+            let pair = |lo: Sym, hi: Sym| -> Option<(Value, Value, Value, u32, u64)> {
+                match (lo, hi) {
+                    (
+                        Sym::Red { op: ol, src: sl, mask: ml, ident: il, lanes: ll },
+                        Sym::Red { op: oh, src: sh, mask: mh, ident: ih, lanes: lh },
+                    ) if ml == mh && il == 0 && ih == 0 && ll == lh => {
+                        let fits = |o: Option<Op>, high: bool, other: Value| {
+                            o.is_none_or(|o| o == Op::AddD { high, other })
+                        };
+                        (fits(ol, false, sh) && fits(oh, true, sl)).then_some((sl, sh, ml, 0, ll))
+                    }
+                    _ => None,
+                }
+            };
+            let (mut rlo, mut rhi) = (unknown(), unknown());
+            if ok {
+                for l in 0..wave as usize {
+                    if let (Some(x), Some(y)) = (pair(alo[l], ahi[l]), pair(blo[l], bhi[l]))
+                        && (x.0, x.1, x.2) == (y.0, y.1, y.2)
+                        && x.4 & y.4 == 0
+                    {
+                        let (sl, sh, m, _, lanes) = (x.0, x.1, x.2, 0, x.4 | y.4);
+                        rlo[l] = Sym::Red { op: Some(Op::AddD { high: false, other: sh }), src: sl, mask: m, ident: 0, lanes };
+                        rhi[l] = Sym::Red { op: Some(Op::AddD { high: true, other: sl }), src: sh, mask: m, ident: 0, lanes };
+                    }
+                }
+            }
+            if let Some(w) = dlo {
+                vec.insert(w, rlo);
+            }
+            if let Some(w) = dhi {
+                vec.insert(w, rhi);
+            }
+            continue;
+        }
         if name == "v_readlane_b32" {
             let (Some(Operand::Scalar { code, .. }), Some(src), Some(lane)) =
                 (v.dst, v.src.first(), v.src.get(1))

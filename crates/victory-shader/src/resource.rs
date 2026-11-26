@@ -1340,11 +1340,40 @@ impl<'a> Tracer<'a> {
                     Ok(source) if self.anywhere(&source) => Ok(source),
                     _ => Err(e),
                 },
-                None => Err(e),
+                None => self.only_descriptor(block, &edge, joins, known).ok_or(e),
             },
         };
         joins.pop();
         source.map(Some)
+    }
+
+    /// The descriptor of the one edge into the join `block` whose registers
+    /// hold one at all, where the lanes' paths cannot tell which edges the
+    /// reading lanes came by. On the others the registers hold no
+    /// descriptor (other data), which a sound program never reads through:
+    /// the console compiler builds a sampler inside a branch that skips code
+    /// when no lane is left for it, and samples after the join; a wave that
+    /// skipped has none of the lanes whose results it keeps (AMD's
+    /// single-pass downsampler `2da4beb386509b77` at 0x4d0, whose stores
+    /// all test those lanes). The forms that run a 64-lane program as two
+    /// host waves of 32 (`ir::without_skips`, `ir::without_early_outs`)
+    /// lose the paths that showed it, and the program stayed refused.
+    fn only_descriptor(
+        &self,
+        block: usize,
+        edge: &dyn Fn(usize) -> Vec<Term>,
+        joins: &mut Vec<usize>,
+        known: &mut Known,
+    ) -> Option<Source> {
+        let mut only = None;
+        for j in 0..self.p.blocks[block].preds.len() {
+            match self.classify(&edge(j), joins, known) {
+                Ok(source) if only.is_none() && self.anywhere(&source) => only = Some(source),
+                Err("a descriptor neither loaded nor built") => {}
+                _ => return None,
+            }
+        }
+        only
     }
 
     /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced

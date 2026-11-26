@@ -363,6 +363,16 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// What title memory at `at` is, if a view of a section made committed:
+/// the section's handle and bytes, and the byte offset of `at` in it.
+pub(crate) fn committed_view_at(at: usize) -> Option<(usize, u64, u64)> {
+    let v = views();
+    let (&base, &(bytes, section, offset)) = v.views.range(..=at).next_back()?;
+    let within = at.checked_sub(base).filter(|&w| w < bytes)?;
+    let &(_, size, committed) = v.sections.iter().find(|s| s.0 == section)?;
+    committed.then_some((section, size, offset + within as u64))
+}
+
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {

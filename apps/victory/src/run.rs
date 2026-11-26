@@ -50,6 +50,14 @@ pub fn run(
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
     let title_dir = exe.parent().unwrap_or(Path::new("."));
+    // The console's precompiled pipelines name their stages by hash: they
+    // are made from the title's own containers in its shader archive.
+    let archive = title_dir.join("shaders.rpf");
+    if archive.is_file() {
+        let index = crate::shader::ArchiveIndex::new(archive);
+        index.warm();
+        victory_hle::modules::d3d12x::set_container_finder(Box::new(move |hashes| index.find(hashes)));
+    }
     // A missing manifest leaves id 0 and no storage quota.
     let manifest =
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
@@ -75,6 +83,20 @@ pub fn run(
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
+        // The title's own builder, for the watch that calls through to it
+        // (`VICTORY_BVH_WATCH=1`, `victory_hle::modules::bvh`).
+        // The title's FidelityFX loader, for the watch of its upscaling (`VICTORY_FFX_WATCH=1`,
+        // `victory_hle::modules::ffx`).
+        if name.eq_ignore_ascii_case("amd_fidelityfx_loader_xbox.dll") {
+            victory_hle::modules::ffx::set_originals(|symbol| {
+                dll.export_symbol(&victory_pe::ImportSymbol::Name { hint: 0, name: symbol.into() })
+            });
+        }
+        if name.eq_ignore_ascii_case("XboxBvhBuilder.dll") {
+            victory_hle::modules::bvh::set_originals(|symbol| {
+                dll.export_symbol(&victory_pe::ImportSymbol::Name { hint: 0, name: symbol.into() })
+            });
+        }
     }
 
     let policy = match unimplemented {
@@ -102,6 +124,9 @@ pub fn run(
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
     show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    // Its FidelityFX upscaler path, where DLSS takes the upscaler's place.
+    #[cfg(windows)]
+    victory_hle::modules::ffx::take_upscaler_path(image.base());
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
@@ -188,7 +213,11 @@ fn watch(base: usize, size: usize) {
 /// DLLs the host or our runtime provide are never taken from the title.
 #[cfg(windows)]
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
-    !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
+    // (the ray-tracing builder is mapped even while `modules::bvh` watches some of its
+    // methods: the watch calls through to it, and the title needs the rest)
+    dll.eq_ignore_ascii_case("XboxBvhBuilder.dll")
+        || dll.eq_ignore_ascii_case("amd_fidelityfx_loader_xbox.dll")
+        || !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
 }
 
 /// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports,

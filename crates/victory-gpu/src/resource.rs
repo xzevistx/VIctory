@@ -1759,12 +1759,58 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let video_memory = crate::host::host().and_then(|h| h.video_memory());
+    let mut idle_ms = crate::host::vram_idle_ms(video_memory);
+    let mut idle_frames = IDLE_FRAMES;
+    // With `VICTORY_TEXTURE_SWEEP_LIMIT` (percent of the card's budget; off
+    // unless said: at 130, run `keep130-*` reached 150% of a budget the
+    // system had cut to 8.9 GB, ran at 2 FPS and the title crashed),
+    // copies are kept while the card's memory in use stays under it (past
+    // the budget the system keeps the overflow in the PC's memory).
+    // Over it, the longest unused go first, only until use is back under
+    // the limit. Letting every copy idle for a second go (as before) let go
+    // of 85,000-92,000 textures in six minutes and uploaded them again
+    // (87-92 GB, 90-110 ms a frame); with none let go (run `nosweep-*`) a
+    // frame was 163 ms instead of 460-520, at 13.9 GB in use of a 10.3 GB
+    // budget.
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_SWEEP_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    let mut need = None;
+    if limit > 0 {
+        let Some([budget, used, ..]) = video_memory.filter(|m| m[0] > 0) else {
+            return;
+        };
+        let over = used.saturating_sub(budget / 100 * limit);
+        if over == 0 {
+            return;
+        }
+        need = Some(over);
+        // A copy a list may be about to record is still protected.
+        (idle_ms, idle_frames) = (2_000, 8);
+    }
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
-    let all = textures();
-    for &at in all.iter() {
+    // Held to the end: a texture leaves the table before it is freed.
+    let table = textures();
+    let mut all: Vec<(u64, usize)> = table
+        .iter()
+        .map(|&at| {
+            // SAFETY: as below.
+            let r = unsafe { &*(at as *const Resource) };
+            (r.host.used.load(Relaxed) & 0xffff_ffff, at)
+        })
+        .collect();
+    // Oldest use first.
+    if need.is_some() {
+        all.sort_unstable();
+    }
+    for &(_, at) in all.iter() {
+        if need == Some(0) {
+            break;
+        }
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
@@ -1774,7 +1820,7 @@ pub(crate) fn let_go_idle() {
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, idle_frames)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -1793,6 +1839,9 @@ pub(crate) fn let_go_idle() {
             KINDS[3].fetch_add(host.bytes, Relaxed);
             went += 1;
             bytes += host.bytes;
+            if let Some(n) = need.as_mut() {
+                *n = n.saturating_sub(host.bytes);
+            }
             if first.is_none() {
                 first = Some(at);
             }

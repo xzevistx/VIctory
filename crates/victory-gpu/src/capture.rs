@@ -346,6 +346,66 @@ pub(crate) fn read_back_of(
     }
 }
 
+/// One copied attachment from the specified upscale dispatch.
+#[cfg(victory_dlss)]
+pub(crate) struct DlssCapture {
+    pub(crate) buffer: ID3D12Resource,
+    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    dispatch: u64,
+    role: &'static str,
+}
+
+#[cfg(victory_dlss)]
+impl DlssCapture {
+    pub(crate) fn save(self) {
+        let f = self.footprint.Footprint;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the host calls this after the list's completion fence. Only
+        // the allocation's actual bytes are mapped, including row padding.
+        unsafe {
+            if self.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+                tracing::warn!(role = self.role, "DLSS capture mapping failed");
+                return;
+            }
+            let bytes = std::slice::from_raw_parts(data.cast::<u8>(), self.buffer.GetDesc().Width as usize);
+            let image = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, f.RowPitch as usize, bytes);
+            self.buffer.Unmap(0, None);
+            if let Some(rgba) = image {
+                let name = format!("dlss-{}-{}", self.dispatch, self.role);
+                save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
+                tracing::info!(name, width = f.Width, height = f.Height, format = f.Format.0, "DLSS attachment captured");
+            } else {
+                tracing::warn!(role = self.role, format = f.Format.0, "DLSS capture format has no preview");
+            }
+        }
+    }
+}
+
+/// Opt-in, one complete upscale dispatch. Never read an attachment back in normal play.
+#[cfg(victory_dlss)]
+pub(crate) fn dlss_dispatch() -> Option<u64> {
+    static TARGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    static DISPATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let target = (*TARGET.get_or_init(|| std::env::var("VICTORY_DLSS_CAPTURE").ok()?.parse::<u64>().ok().filter(|&n| n > 0)))?;
+    let n = DISPATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    (n == target && folder().is_some()).then_some(n)
+}
+
+#[cfg(victory_dlss)]
+pub(crate) fn dlss_attachment(list: &crate::host::HostList, dispatch: u64, role: &'static str, resource: usize, restore: u32) {
+    let Some(texture) = crate::resource::host_resource(resource as crate::object::This) else { return };
+    let Some(host) = crate::host::host() else { return };
+    let id = resource as crate::object::This;
+    crate::list::ensure_state(list, id, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+    let read = read_back(&host.device, &list.list, texture);
+    crate::list::ensure_state(list, id, restore);
+    if let Some((buffer, footprint)) = read {
+        list.defer_dlss_capture(DlssCapture { buffer, footprint, dispatch, role });
+    } else {
+        tracing::warn!(role, "DLSS capture allocation failed");
+    }
+}
+
 /// Saves a frame read back by [`read_back`] (8-bit color only).
 pub(crate) fn save_read_back(
     frame: u64,

@@ -155,6 +155,9 @@ pub(crate) struct Shader {
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
+    /// A store or atomic through a raw title address was lowered
+    /// ([`super::HostShader::memory_stores`]).
+    pub memory_stores: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
@@ -212,6 +215,7 @@ impl Shader {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             flags: 0,
+            memory_stores: false,
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
