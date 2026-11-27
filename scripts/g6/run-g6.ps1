@@ -21,16 +21,18 @@ Get-ChildItem Env: | Where-Object { $_.Name -like 'VICTORY_*' } | ForEach-Object
 $s = [ordered]@{
     # Vice-Tay's scripts/play.ps1 -Machine 4070 (TaynanGT, GPL-3.0), not -Safe:
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
-    # Not VICTORY_INDIRECT_WINDOW=1 / VICTORY_INDIRECT_BATCH=2 (g6-vt2): with them G6's
-    # tiled passes read stale tile counts and left black blocks on the water and
-    # blocky textures (runs fix-t1 against fix-t2, same scenes; no slower without).
+    # Not VICTORY_INDIRECT_WINDOW=1 / VICTORY_INDIRECT_BATCH=2 (g6-vt2): first blamed for
+    # the water blocks (that was VICTORY_WAVE_NATIVE below); left out, no slower without.
     VICTORY_JOIN_COPIES = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
     VICTORY_TITLE_PRIORITIES = '0'; VICTORY_SHOW_AFTER = '1'; VICTORY_D3D12_DRED = 'light'; VICTORY_PLACED_ORDER = '1'
     VICTORY_THIN_THREADS = '8'; VICTORY_UNDER_THREADS = '6'; VICTORY_LAND_THREADS = '4'; VICTORY_PIPELINE_WORKERS = '3'
     VICTORY_CARD_RESERVE_BUDGETS = '1'; VICTORY_CARD_BUFFERS_MIN_KB = '64'; VICTORY_CARD_BUFFERS_MB = '1536'
     VICTORY_CARD_WINDOWS_MB = '1024'; VICTORY_THIN = '1'; VICTORY_JOIN_PARTS = '8'; VICTORY_UPLOAD_AHEAD = '1'
     # g6-vt2 reference settings (see G6-FORK.md, "Switches that matter"):
-    VICTORY_WAVE_NATIVE = '0'; VICTORY_LAZY_ALIAS = '0'; VICTORY_HIGH_VIEWS = '0'; VICTORY_UPLOAD_SLOTS_TOP_DOWN = '0'
+    # VICTORY_WAVE_NATIVE=1: the water programs' 64-lane wave code runs as plain 32-lane
+    # waves; with 0 their fallback left black and white squares on the sea and in pools
+    # (runs fix-t8 against fix-t9, same shots; 18.1 vs 18.4 FPS).
+    VICTORY_WAVE_NATIVE = '1'; VICTORY_LAZY_ALIAS = '0'; VICTORY_HIGH_VIEWS = '0'; VICTORY_UPLOAD_SLOTS_TOP_DOWN = '0'
     VICTORY_CARD_BUFFERS_FIRST = '0'; VICTORY_MAP_THREADS = '1'; VICTORY_PIPELINE_WAIT_MS = '500'
 }
 foreach ($k in $s.Keys) { Set-Item "Env:$k" $s[$k] }

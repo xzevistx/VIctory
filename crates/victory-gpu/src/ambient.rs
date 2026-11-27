@@ -540,6 +540,13 @@ void hold(uint3 at : SV_DispatchThreadID) {
     }
     float top = most * dot(around, LUMA);
     float3 c = unpack(light[at.xy]);
+    // Magenta (green far below red and blue) is the memory the traces left,
+    // as in the diffuse resolve: the light around in its place (g6-vt2:
+    // purple-red leaves with rays off, green with the title's rays).
+    if (c.g < 0.5 * min(c.r, c.b) && max(c.r, c.b) > 0.02) {
+        light[at.xy] = pack(min(around, top));
+        return;
+    }
     float has = dot(c, LUMA);
     if (has > top) light[at.xy] = pack(c * (top / has));
 }
@@ -604,6 +611,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    // The estimate is gathered from the frame before: magenta there must not
+    // feed itself (g6-vt2), so a magenta estimate keeps only its brightness.
+    if (found.g < 0.5 * min(found.r, found.b)) found = dot(found, LUMA).xxx;
     float3 was = unpack(light[p]);
     float left = dot(was, LUMA);
     // Magenta (green far below red and blue) is what the probes' memory held, not light.

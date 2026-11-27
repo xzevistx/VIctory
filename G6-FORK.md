@@ -61,7 +61,7 @@ You need your own legal dump of the title. No game files are in this repository.
 | UPLOAD SLOTS free/all OUT n NO ROOM n | the memory reserved at start for list uploads and memory by address; NO ROOM above 0 is trouble |
 | RAM FREE | the PC's free physical memory |
 | BUILD | build folder and exe hash |
-| N L B P | switches: wave native, lazy alias, buffers first, precompiled (1 on) |
+| N L B P | switches: wave native, lazy alias, buffers first, precompiled (1 on; the defaults show N1 L0 B0 P0) |
 
 ## What this branch adds over upstream (where to look)
 
@@ -92,11 +92,11 @@ Measured on the same scenes from one saved game, Series S + DLSS, rays off:
 
 | Fault | Cause | Fix (default) | Turn it off |
 |---|---|---|---|
-| Black blocks on water, a stray square in the sky, blocky mosaic textures (a shirt) | the Vice-Tay set's `VICTORY_INDIRECT_WINDOW=1` / `VICTORY_INDIRECT_BATCH=2`: G6's tiled passes read stale tile counts, so tiles stayed unshaded | `run-g6.ps1` no longer sets them (runs fix-t1 against fix-t2: blocks gone, 16.0 → 18.6 FPS) | set them again with `-Extra` |
+| Black (and white) squares lying on the water: sea, pools, the shore | the translator's fallback for the water programs' 64-lane wave code (`VICTORY_WAVE_NATIVE=0`, set by the tested switch set since an old FPS suspicion) | `run-g6.ps1` sets `VICTORY_WAVE_NATIVE=1`: those programs run as plain 32-lane waves (`emit/mod.rs` `emit()`, `lower::wave_local`). Runs fix-t8 (blocks) against fix-t9 (clean), same shots, 18.1 vs 18.4 FPS. (`VICTORY_INDIRECT_WINDOW/BATCH` were first blamed; they are left out of `run-g6.ps1` too, no slower.) | `-Extra 'VICTORY_WAVE_NATIVE=0'` |
 | Purple / magenta glow | with rays off, the screen probes' memory holds garbage that comes out magenta | the stand-in lighting is on unless `VICTORY_AMBIENT` is set: 0.8 of the estimate, air bounded at 2x, reflections held at 2x on `CombinedReflections` (`ambient.rs` `G6_*`); magenta pixels 0.53% → 0.04–0.2% | `VICTORY_AMBIENT=0` |
 | Old blocks of skin and clothes staying on characters | textures picked by index were checked 5 times (3 small samples) and then never again; G6 fills large textures later | checked every 400 frames for good, 8 samples spread over large textures (`draw.rs` `recheck_long`, `texture.rs` `fingerprint`) | `VICTORY_HEAP_RECHECK_LONG=0` |
 
-Still open: whiteout when the camera goes underwater and in the sunset rooftop chase (probe and air light with rays off); smooth untextured background characters in fast cuts (the title's lowest streaming levels shown because the full ones arrive late).
+Still open: whiteout when the camera goes underwater and in the sunset rooftop chase (probe and air light with rays off); purple-red foliage with rays off (green with the title's rays; the magenta rules in `ambient.rs` reduce it).
 
 ## Ray tracing (why outdoor scenes glow white)
 
