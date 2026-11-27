@@ -89,6 +89,33 @@ enum Stop {
     Fail(ShaderError),
 }
 
+thread_local! {
+    static UINT_SRVS: std::cell::Cell<&'static [(u8, u32, u32)]> = const { std::cell::Cell::new(&[]) };
+}
+
+thread_local! {
+    static EXPORT_CLAMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with float exports to colour targets held at
+/// ±65504 past the f16 range ([`Lower::nan_guard`]). Asked by the host for
+/// pipelines with no 32-bit float target only: the host makes infinities of
+/// such values in f16 targets, but a 32-bit target holds them rightly (the
+/// title's exposure sums go past 70,000, and clamping them there banded the
+/// grade, build VT-CLAMP).
+pub fn with_export_clamp<R>(f: impl FnOnce() -> R) -> R {
+    let was = EXPORT_CLAMP.with(|c| c.replace(true));
+    let back = f();
+    EXPORT_CLAMP.with(|c| c.set(was));
+    back
+}
+
+/// The SRVs the next [`lower`] on this thread reads as unsigned integers
+/// (see `tiled_lighting_uint_srvs`).
+pub(crate) fn set_uint_srvs(views: &'static [(u8, u32, u32)]) {
+    UINT_SRVS.with(|u| u.set(views));
+}
+
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     lower_counted(parts, counted_in_threads(parts))
 }
@@ -267,6 +294,8 @@ struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
+    /// SRVs the title reads as unsigned integers: (root slot, table dword, view kind).
+    uint_srvs: &'static [(u8, u32, u32)],
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
     floats: HashMap<Value, V>,
@@ -2084,6 +2113,7 @@ impl<'a> Lower<'a> {
             s,
             x,
             bad,
+            uint_srvs: UINT_SRVS.with(|u| u.get()),
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
             floats: HashMap::new(),
@@ -4612,7 +4642,19 @@ impl<'a> Lower<'a> {
             let quiet = self.s.m.i32(0x7FC0_0000);
             self.s.m.cmp(c, pred::EQ, abs, quiet)
         };
-        let inf = self.s.m.cmp(c, pred::EQ, abs, inf_bits);
+        // In [`with_export_clamp`], on float targets: finite values past the f16 range
+        // are held at ±65504 too. The host turns them into infinities in f16 targets;
+        // later passes make NaNs of those (black holes in bright light), and once they
+        // reach the exposure average the whole picture goes black.
+        let clamp = strict && EXPORT_CLAMP.with(|c| c.get());
+        let inf = if clamp {
+            let past = self.s.m.i32(65504f32.to_bits());
+            let big = self.s.m.cmp(c, pred::IUGT, abs, past);
+            let finite_or_inf = self.s.m.cmp(c, pred::IULE, abs, inf_bits);
+            self.s.m.bin(c, Bin::And, big, finite_or_inf)
+        } else {
+            self.s.m.cmp(c, pred::EQ, abs, inf_bits)
+        };
         let sign_bit = self.s.m.i32(0x8000_0000);
         let sign = self.s.m.bin(c, Bin::And, bits, sign_bit);
         let big = self.s.m.i32(65504f32.to_bits());
@@ -7332,7 +7374,8 @@ impl<'a> Lower<'a> {
                     5 => 7,
                     _ => return Err("an image dimension (cube or MSAA)"),
                 };
-                ((kind | u, 0x409), Some(kind))
+                let ty = if !uav && self.scalar_uint_srv(&src, kind) { 0x105 } else { 0x409 };
+                ((kind | u, ty), Some(kind))
             }
             Fields::Buffer { idxen, format, .. } => {
                 let stride = used.map_or(0, |u| u.stride);
@@ -7342,7 +7385,8 @@ impl<'a> Lower<'a> {
                 let props = if un.starts_with("buffer_load_format")
                     || un.starts_with("buffer_store_format")
                 {
-                    (10 | u, 0x409)
+                    let ty = if !uav && self.scalar_uint_srv(&src, 10) { 0x105 } else { 0x409 };
+                    (10 | u, ty)
                 } else if !counted
                     && *idxen
                     && format.is_none()
@@ -8036,6 +8080,41 @@ impl<'a> Lower<'a> {
             .find(|u| u.user_data == rp.user_data)
             .map(|u| u.kind);
         (kind == Some(ResourceType::Uav)).then(|| self.host_word(RootType::Other(USER_VIEW_BIAS), rp.slot, 0))
+    }
+
+    /// Whether `src` is one of the SRVs the title reads as unsigned integers
+    /// (`uint_srvs`): a fixed dword of a root table.
+    fn scalar_uint_srv(&self, src: &Source, kind: u32) -> bool {
+        if self.uint_srvs.is_empty() {
+            return false;
+        }
+        let Source::Loaded { load, first } = src else {
+            return false;
+        };
+        let Some(address) = self.scalar.get(load) else {
+            return false;
+        };
+        let Some(root) = self.x.native.layout.get(address.param) else {
+            return false;
+        };
+        if root.root != RootType::Table
+            || address.dynamic.is_some()
+            || !address.offset.is_multiple_of(4)
+        {
+            return false;
+        }
+        self.uint_srvs
+            .contains(&(root.slot, address.offset / 4 + u32::from(*first), kind))
+    }
+
+    /// The result of a typed read: four integers for an integer view.
+    fn resource_return_type(&mut self, uint: bool) -> super::bitcode::Ty {
+        if uint {
+            let i32t = self.s.t.i32;
+            self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5])
+        } else {
+            self.s.t.res_ret
+        }
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -11697,7 +11776,14 @@ impl<'a> Lower<'a> {
             self.s.flags |= flags::ROVS;
         }
         let rov = if ordered { 0x2000 } else { 0 };
-        let props = (kind | if uav { 0x1000 } else { 0 } | rov, 0x409);
+        // The light lists and masks of the tiled lighting are unsigned integers: read as
+        // floats they are denormals and no lamp reaches a tile (`tiled_lighting_uint_srvs`).
+        let uint = !uav
+            && !*d16
+            && *dmask == 1
+            && matches!(name, "image_load" | "image_gather4_lz")
+            && self.scalar_uint_srv(src, kind);
+        let props = (kind | if uav { 0x1000 } else { 0 } | rov, if uint { 0x105 } else { 0x409 });
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // GLC returns the old value. DXIL implements subtraction by adding
             // the two's complement of the operand at the same width.
@@ -12355,7 +12441,13 @@ impl<'a> Lower<'a> {
                     } else {
                         args.extend(&os[..2]);
                         args.push(self.s.m.i32(dmask.trailing_zeros()));
-                        call_sample(self, "textureGather.f32", 73, &args, &mut gathered)
+                        if uint {
+                            // (one sampler: a gather of integers is not filtered)
+                            let ret = self.resource_return_type(true);
+                            self.s.op(c, "textureGather.i32", Attr::ReadOnly, ret, 73, &args)
+                        } else {
+                            call_sample(self, "textureGather.f32", 73, &args, &mut gathered)
+                        }
                     }
                 }
             }
@@ -12376,11 +12468,12 @@ impl<'a> Lower<'a> {
             let mut args = vec![h, mip];
             args.extend(&cs);
             args.extend([iu, iu, iu]);
+            let ret = self.resource_return_type(uint);
             self.s.op(
                 c,
-                "textureLoad.f32",
+                if uint { "textureLoad.i32" } else { "textureLoad.f32" },
                 Attr::ReadOnly,
-                self.s.t.res_ret,
+                ret,
                 66,
                 &args,
             )
@@ -12399,7 +12492,9 @@ impl<'a> Lower<'a> {
                 Some(g) => g[ch as usize],
                 None => self.s.m.extract(c, r, ch),
             };
-            xs.push(if *d16 {
+            xs.push(if uint {
+                x
+            } else if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
                 // nearest even); integer formats would keep 16 bits.
                 let i32t = self.s.t.i32;
@@ -12919,6 +13014,7 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        let uint = name == "buffer_load_format_x" && !uav && self.scalar_uint_srv(src, 10);
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
@@ -12926,13 +13022,14 @@ impl<'a> Lower<'a> {
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
             }
-            let h = self.handle(site, src, false, (10 | u, 0x409))?;
+            let h = self.handle(site, src, false, (10 | u, if uint { 0x105 } else { 0x409 }))?;
             let index = index.unwrap_or(self.s.m.i32(0));
+            let ret = self.resource_return_type(uint);
             self.s.op(
                 c,
-                "bufferLoad.f32",
+                if uint { "bufferLoad.i32" } else { "bufferLoad.f32" },
                 Attr::ReadOnly,
-                self.s.t.res_ret,
+                ret,
                 68,
                 &[h, index, iu],
             )
@@ -13017,7 +13114,7 @@ impl<'a> Lower<'a> {
         }
         for k in 0..count {
             let x = self.s.m.extract(c, r, k);
-            let x = self.as_int(x);
+            let x = if uint { x } else { self.as_int(x) };
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())

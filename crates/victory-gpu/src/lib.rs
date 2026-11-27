@@ -47,6 +47,7 @@ mod draw;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
+pub mod dxr;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
@@ -69,8 +70,12 @@ pub mod port_descriptors;
 mod port_journal;
 #[cfg(windows)]
 mod land;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod landwatch;
 #[cfg(all(test, windows))]
 mod loadprobe;
+#[cfg(windows)]
+mod fpsbox;
 pub mod list;
 pub mod object;
 pub mod pipeline;
@@ -122,6 +127,8 @@ mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use fpsbox::{Note as PanelNote, note as panel_note};
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
@@ -141,10 +148,10 @@ pub fn frames_begun() -> u64 {
     frame::current()
 }
 #[cfg(windows)]
-pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
+pub use inplace::{high_views, title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
     kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
-    title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
+    title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written, use_lazy_mapper,
     writing as kernel_will_write,
 };

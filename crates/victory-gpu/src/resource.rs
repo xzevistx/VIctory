@@ -2132,6 +2132,11 @@ pub(crate) fn let_go_idle() {
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
+    // Copies of title buffers made past the card's room line
+    // (`VICTORY_CARD_BUFFERS_FIRST=1`): that many bytes of the textures idle
+    // longest go now, those idle a second and more.
+    let wanted = crate::shadow::room_wanted();
+    let (idle_ms, most) = if wanted > 0 { (idle_ms.min(1_000), wanted.max(if most == u64::MAX { 0 } else { most })) } else { (idle_ms, most) };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -2209,6 +2214,19 @@ pub(crate) fn let_go_idle() {
                 first = Some(at);
             }
             crate::host::retire(host);
+        }
+    }
+    if wanted > 0 {
+        crate::shadow::room_given(bytes);
+        static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SAID.fetch_add(1, Relaxed) + 1;
+        if n <= 16 || n.is_power_of_two() {
+            tracing::info!(
+                wanted_mb = wanted >> 20,
+                let_go_mb = bytes >> 20,
+                textures = went,
+                "textures let go for copies of title buffers made past the card's room line (VICTORY_CARD_BUFFERS_FIRST=1)"
+            );
         }
     }
     SWEPT_US[0].fetch_add(1, Relaxed);

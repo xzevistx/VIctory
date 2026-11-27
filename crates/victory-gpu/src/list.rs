@@ -978,6 +978,32 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
     let _ = (this, dst, src);
 }
 
+/// Host ray-tracing structures built at the current place of list `this`
+/// (`crate::dxr`).
+pub(crate) fn structures(this: This, builds: Box<Vec<crate::dxr::Build>>) {
+    let boxed = Box::into_raw(builds) as usize as u64;
+    #[cfg(windows)]
+    if thin::on() {
+        thin::record_structures(this, boxed);
+        return;
+    }
+    structures_op(this, boxed);
+}
+
+pub(crate) extern "system" fn structures_op(this: This, boxed: u64) {
+    if boxed == 0 {
+        return;
+    }
+    // SAFETY: made by `Box::into_raw` in [`structures`], taken once.
+    let builds = unsafe { Box::from_raw(boxed as usize as *mut Vec<crate::dxr::Build>) };
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        crate::dxr::run(list, &builds);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, builds);
+}
+
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
     copy_resource(this, dst, src);
 }
@@ -1628,6 +1654,7 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
         return std::ptr::null_mut();
     };
     if this.is_null() || !align.is_power_of_two() {
+        tracing::warn!(size, alignment, "upload memory asked with no list or an alignment that is no power of two: none given");
         return std::ptr::null_mut();
     }
     let Some(mut block) = Upload::new(len) else {

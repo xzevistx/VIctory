@@ -69,6 +69,9 @@ pub(crate) struct Shader {
     pub(crate) probe: Option<crate::lightprobe::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// The translation with float exports clamped ([`Shader::translated_clamped`]).
+    #[cfg(windows)]
+    clamped: OnceLock<Option<Translated>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -123,6 +126,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 probe: crate::lightprobe::on().then(|| crate::lightprobe::role(bytes)).flatten(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                clamped: OnceLock::new(),
             })
         })
         .clone()
@@ -204,8 +209,39 @@ impl Shader {
     }
 }
 
+/// `VICTORY_EXPORT_CLAMP=1`: pixel shaders of pipelines with no 32-bit float
+/// target get [`Shader::translated_clamped`] (float exports held at ±65504).
+#[cfg(windows)]
+pub(crate) fn export_clamp_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_EXPORT_CLAMP"))
+}
+
+#[cfg(windows)]
+impl Shader {
+    /// The translation with float exports to colour targets held at
+    /// ±65504 ([`victory_shader::emit::with_export_clamp`]), made on first
+    /// use; its resources and root are those of [`Shader::translated`].
+    pub(crate) fn translated_clamped(&self) -> Option<&Translated> {
+        self.clamped
+            .get_or_init(|| match translate_as(&self.container, true) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    tracing::warn!(stage = self.stage, hash = %self.hash, error = %e, "clamped translation failed; the plain one is used");
+                    None
+                }
+            })
+            .as_ref()
+    }
+}
+
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
+    translate_as(container, false)
+}
+
+#[cfg(windows)]
+fn translate_as(container: &[u8], clamped: bool) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
@@ -214,7 +250,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    let host = if clamped {
+        crate::shader_cache::host_shader_clamped(container)?
+    } else {
+        crate::shader_cache::host_shader(container)?
+    };
     let stores = programs.is_empty() || programs.iter().any(stores);
     let threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
@@ -467,6 +507,20 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// As [`host_pipeline`], for draws of the console's rectangles
+/// ([`make::ready_rects`]).
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(this: This, rects: bool) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    if rects {
+        make::ready_rects(&pipeline(this).host)
+    } else {
+        make::ready(&pipeline(this).host)
+    }
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
@@ -499,11 +553,38 @@ pub(super) fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// The pixel shaders of the title's wet weathering passes
+/// (`PS_TiledWeathering*_WET*`, both builds of each): left out unless
+/// `VICTORY_WET_WEATHERING=1`. The tiles they shade are marked wet indoors
+/// and dry, skin included: faces and arms showed sharp glossy streaks and
+/// sparkles under neon and police lights, and dry walls blue-white smears
+/// (runs glow-hold2-* and shots-b-*); without them (run no-wet-*) skin and
+/// walls are matte. shortcut: what marks the tiles wet is not found yet;
+/// rain and puddles are dry meanwhile. (From xzevistx/VIctory g6-dlss.)
+#[cfg(windows)]
+const WET_WEATHERING: &str = concat!(
+    "bd768869e6a9bbb9,", "6c21bcbcc3416dce,", "9507e549b138f78a,", "1f8ed9edbc018811,", "75165dea28997f64,", "979be1a39ef9a780,",
+    "1d19dead161179e0,", "45d9fb41a3f091ad,", "f5631d02141ccf4a,", "32dafebdbfabac96,", "2c42f1061b991556,", "b9e4d3aab6a1b39c,",
+    "268d3bd5a97bc55a,", "5d31abc11729b4b8,", "4c3f209401b1c561,", "b00e9c5ddc9b19f6,", "79ee054eed4ef0f2,", "dd44029cb5188179,",
+    "a03a5b004229d736,", "7e790dc9978e728b,", "b7eb97debe7f232f,", "51b6604981878b6e,", "edef484af6e06ecd,", "276095b0008866b5,",
+    "37849edc52ccf0e0,", "09872d838262a1b2,", "cd494288f1a8e1c0,", "635fb84587970774,", "0fc6cbeb2f7104f6,", "424d7d00f2d6f528,",
+    "7c7b0727a2a9363b,", "2896307ec3d5a1fd,", "c63d5562b559c111,", "4ef7f52b61ea7cb6,", "b8ae4f188396efe2,", "afee430d360e8b8c,",
+    "9e34f46bca161e5f,", "33076f25f1436137,", "78ec1a6cca5c6b60,", "6663f768dce77155,", "3ff205fd9ea10c68,", "c4c70b24fb9a9e6f,",
+    "9ada5cf01caffc72,", "5ed78af77dc3f3e2,", "fa3534fe1e406e51,", "766d52cd7d614053,", "17b5286d402a7c0c,", "94f4fdd63217f833,",
+    "6e3dd0a722db7fbd,", "91980dc12cb0969a,", "40deac5fc988f351,", "1870bb9633c30fc4,", "3fc3a49cf5294684,", "18fa17c244b1043b,",
+    "b77c96c8aa1687eb,", "c7b9d33d04ce489f,", "b986f4edd4ed5e53,", "32b625e06f106d8c,", "94268e8eff4dc1a2,", "6cab7f93bd2f57b1,",
+    "7b5e713a559fc728,", "220fcfc4973cd801,", "7af9b426673ce896,", "cb8af919d9e2512c,",
+);
+
 #[cfg(windows)]
 pub(super) fn skip_hashes() -> &'static [String] {
     static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     HASHES.get_or_init(|| {
-        let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
+        let mut value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
+        if std::env::var_os("VICTORY_WET_WEATHERING").is_none_or(|v| v != "1") {
+            value.push(',');
+            value.push_str(WET_WEATHERING);
+        }
         parse_skip_hashes(&value)
     })
 }
@@ -664,6 +745,128 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
     Some(shader(stage, unsafe {
         std::slice::from_raw_parts(code.code, code.size)
     }))
+}
+
+/// Finds the title's shader containers by their stage hash (the 16 bytes of
+/// a container's `HASH` part after its flags): for each hash asked, the
+/// container, or `None`. Set by the runner, which reads the title's shader
+/// archive (the archive stays packed; containers are unpacked as asked).
+/// Ported from the "cuda-nvidia card implant" patches (precompiled
+/// pipelines, `VICTORY_PRECOMPILED=1`).
+pub type ContainerFinder = dyn Fn(&[[u8; 16]]) -> Vec<Option<Vec<u8>>> + Send + Sync;
+static FINDER: OnceLock<Box<ContainerFinder>> = OnceLock::new();
+
+/// See [`ContainerFinder`].
+pub fn set_container_finder(finder: Box<ContainerFinder>) {
+    let _ = FINDER.set(finder);
+}
+
+/// The stage a container's native program runs as, for [`shader`].
+fn stage_of(container: &[u8]) -> Option<&'static str> {
+    use victory_shader::{Container, FourCC, HwStage, native_programs};
+    let c = Container::parse(container).ok()?;
+    let programs = native_programs(c.part(FourCC::DXIL)?.data).ok()?;
+    programs.iter().find_map(|p| match p.stage {
+        HwStage::Vs => Some("vertex"),
+        HwStage::Ps => Some("pixel"),
+        HwStage::Ms => Some("mesh"),
+        HwStage::Cs => Some("compute"),
+        _ => None,
+    })
+}
+
+/// A pipeline the console's driver had compiled ahead (device methods
+/// 0x1c8 and 0x218): made from the title's own containers of the stages it
+/// names by hash, as if the title had passed those. `None` when a stage is
+/// not found (the caller then refuses the call, as before).
+pub(crate) fn create_precompiled(
+    hashes: &[[u8; 16]],
+    blocks: Option<(&[u8], &[u8])>,
+    iid: *const Iid,
+    out: *mut This,
+) -> Option<HRESULT> {
+    // Diagnostics: why one is not made (the first 32), for the next layout
+    // to decode.
+    #[cfg(feature = "diagnostics")]
+    let why = |what: &str| {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
+            let hex: Vec<String> = hashes.iter().map(|h| h.iter().map(|b| format!("{b:02x}")).collect()).collect();
+            tracing::info!(state = blocks.map(|b| b.0.len()), "precompiled pipeline not made: {what} {hex:?}");
+        }
+    };
+    #[cfg(not(feature = "diagnostics"))]
+    let why = |_: &str| {};
+    let finder = FINDER.get()?;
+    let found = finder(hashes);
+    let mut stages: Vec<(&'static str, Vec<u8>)> = Vec::new();
+    for container in found {
+        let Some(container) = container else {
+            why("a stage's container is not in the archive");
+            return None;
+        };
+        let Some(stage) = stage_of(&container) else {
+            why("a stage's kind is not known");
+            return None;
+        };
+        stages.push((stage, container));
+    }
+    // A compute stage beside a mesh stage is its amplification stage.
+    if stages.iter().any(|s| s.0 == "mesh") {
+        for s in &mut stages {
+            if s.0 == "compute" {
+                s.0 = "amplification";
+            }
+        }
+    }
+    const ORDER: [&str; 5] = ["amplification", "mesh", "vertex", "pixel", "compute"];
+    stages.sort_by_key(|s| ORDER.iter().position(|o| *o == s.0));
+    let compute = stages.iter().all(|s| s.0 == "compute");
+    // A draw pipeline needs its vertex or mesh stage and its state.
+    #[cfg(windows)]
+    let graphics = if compute {
+        None
+    } else {
+        if !stages.iter().any(|s| s.0 == "vertex" || s.0 == "mesh") {
+            why("no vertex or mesh stage");
+            return None;
+        }
+        let Some((state, layout)) = blocks else {
+            why("no state block of a known size");
+            return None;
+        };
+        let Some(g) = host::GraphicsState::from_console(state, layout) else {
+            why("from_console refused the state");
+            return None;
+        };
+        #[cfg(feature = "diagnostics")]
+        if std::env::var_os("VICTORY_PRECOMPILED_LOG").is_some_and(|v| v == "1") {
+            let hex = |b: &[u8]| {
+                b.chunks(4)
+                    .map(|w| format!("{:08x}", u32::from_le_bytes(w.try_into().unwrap_or_default())))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            tracing::info!(
+                stages = ?stages.iter().map(|s| (s.0, blake3::hash(&s.1).to_hex()[..16].to_owned())).collect::<Vec<_>>(),
+                state_block = hex(state),
+                layout_block = hex(layout),
+                "precompiled pipeline state: {}",
+                g.describe()
+            );
+        }
+        Some(Box::new(g))
+    };
+    #[cfg(not(windows))]
+    let _ = (compute, blocks);
+    let shaders = stages.iter().map(|(stage, bytes)| shader(stage, bytes)).collect();
+    Some(hand_out(
+        shaders,
+        #[cfg(windows)]
+        graphics,
+        iid,
+        out,
+    ))
 }
 
 fn hand_out(
@@ -870,6 +1073,18 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod make;
+
+/// The shader translator's fingerprint (its sources, `build.rs`): the
+/// start-up warm-up runs again when it changes.
+pub fn translator_id() -> &'static str {
+    env!("VICTORY_TRANSLATOR")
+}
+
+/// Host pipelines queued and not made yet (the start-up splash's count).
+#[cfg(windows)]
+pub fn being_made() -> u64 {
+    make::waiting()
+}
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

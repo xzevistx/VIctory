@@ -20,6 +20,12 @@ extern "system" fn create_device(
     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
     victory_gpu::resource::use_many_page_mapper(super::xmem::map_aliases);
+    // `VICTORY_LAZY_ALIAS=1`: GPU page-mapping copies get no view of their
+    // own; reads and writes of them go through views of the same pages.
+    #[cfg(windows)]
+    if super::xmem::lazy_alias() {
+        victory_gpu::use_lazy_mapper(super::xmem::map_lazy, super::xmem::lazy_source);
+    }
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
     device::create(adapter, parameters, iid, out)

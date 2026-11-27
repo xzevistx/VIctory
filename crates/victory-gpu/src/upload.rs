@@ -54,15 +54,90 @@ fn gap(taken: &[bool], n: usize) -> Option<usize> {
     None
 }
 
+/// Allocations claimed once at start for [`reserve`] (g6-vt2): the process
+/// fills [4 GiB, 2^37) bottom-up as G6 streams (124 GiB of it taken, 40 MiB
+/// free in gaps of under 5 MiB, at a cutscene's pre-streaming), and a failed
+/// arena then gave the title's BVH builder a null `allocate_upload`, on
+/// which its checked copy ends the game. Each slot is an allocation of its
+/// own, as a fresh arena was: one 1 GiB reservation cut in pieces (build
+/// VT2-POOL) broke textures into page-sized blocks of purple and stale
+/// data (runs vt2-save-*, vt2-ab-low-lazy; clean with it off, vt2-ab-alloff).
+/// Address, bytes, handed out.
+static SLOTS: Mutex<Vec<(usize, usize, bool)>> = Mutex::new(Vec::new());
+
+/// `VICTORY_UPLOAD_POOL_MB=0`: no slots, each arena placed when needed.
+fn slots_on() -> bool {
+    std::env::var("VICTORY_UPLOAD_POOL_MB").is_ok_and(|v| v == "0").then_some(false).unwrap_or(true)
+}
+
+/// Claims the slots (reserved, not committed): the directory of memory by
+/// address (16 MiB), its arenas (64 MiB), list-upload arenas (4 MiB). Call
+/// before the title's memory grows.
+pub(crate) fn claim() {
+    let mut slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    if !slots.is_empty() || !slots_on() {
+        return;
+    }
+    let sizes = [(16usize << 20, 1usize), (64 << 20, 4), (ARENA, 64)];
+    // Leave the bottom of the title's addressing window free for streamed resources.
+    // This switch affects only the early reservations, so later allocations retain their order.
+    let top_down = std::env::var_os("VICTORY_UPLOAD_SLOTS_TOP_DOWN").is_some_and(|v| v == "1");
+    for (bytes, n) in sizes {
+        for _ in 0..n {
+            match place(bytes, false, top_down) {
+                Some(at) => slots.push((at, bytes, false)),
+                None => break,
+            }
+        }
+    }
+    let total: usize = slots.iter().map(|s| s.1).sum();
+    let first = slots.iter().map(|s| s.0).min();
+    let end = slots.iter().map(|s| s.0 + s.1).max();
+    tracing::info!(slots = slots.len(), bytes = total, top_down, ?first, ?end, "allocations claimed for list uploads and title memory by address");
+}
+
 /// Fresh zeroed memory in [4 GiB, 2^37) (where the directory of memory by
 /// address reaches, `MEMORY_PAGES`), write-watched as the title's own
-/// pools are (copies then take only written pages).
+/// pools are (copies then take only written pages): a claimed slot of
+/// exactly that size while one is left.
 pub(crate) fn reserve(len: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
+    let len = len.max(1).next_multiple_of(BLOCK);
+    {
+        let mut slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = slots.iter_mut().find(|s| !s.2 && s.1 == len) {
+            // SAFETY: the whole of a reservation of ours, handed out once.
+            let done = unsafe { VirtualAlloc(slot.0 as *const _, len, MEM_COMMIT, PAGE_READWRITE) };
+            if !done.is_null() {
+                slot.2 = true;
+                return Some(slot.0);
+            }
+        }
+    }
+    let at = place(len, true, false);
+    if at.is_none() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(len, "no room left in [4 GiB, 2^37) for list uploads or title memory by address (VICTORY_UPLOAD_POOL_MB claims more at start)"));
+    }
+    at
+}
+
+/// A new reservation of `len` bytes in [4 GiB, 2^37), write-watched;
+/// committed with `commit`.
+fn place(len: usize, commit: bool, top_down: bool) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{
         MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_RESERVE, MemExtendedParameterAddressRequirements,
         PAGE_READWRITE, VirtualAlloc2,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    const MEM_TOP_DOWN: u32 = 0x10_0000;
+    let mut flags = MEM_RESERVE | MEM_WRITE_WATCH;
+    if commit {
+        flags |= MEM_COMMIT;
+    }
+    if top_down {
+        flags |= MEM_TOP_DOWN;
+    }
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: (1usize << 32) as *mut _,
         HighestEndingAddress: ((1usize << 37) - 1) as *mut _,
@@ -78,7 +153,7 @@ pub(crate) fn reserve(len: usize) -> Option<usize> {
             std::ptr::null_mut(),
             std::ptr::null(),
             len,
-            MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+            flags,
             PAGE_READWRITE,
             &mut parameter,
             1,

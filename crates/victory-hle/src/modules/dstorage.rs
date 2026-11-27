@@ -887,6 +887,9 @@ impl Lanes {
 
     fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
         self.staged -= job.staging;
+        // For the in-game panel's streaming line.
+        victory_gpu::panel_note(victory_gpu::PanelNote::Streamed, u64::from(job.request.destination_size));
+        victory_gpu::panel_note(victory_gpu::PanelNote::StreamRequests, 1);
         if let Some(lane) = self.lanes.get_mut(&job.lane) {
             lane.running.remove(&job.seq);
             if let Err(hr) = result {

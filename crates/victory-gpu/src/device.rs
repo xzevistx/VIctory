@@ -364,12 +364,175 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
 ) -> HRESULT {
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+    static MADE: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
     let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
-    if calls <= 4 || calls.is_power_of_two() {
+    // Ported from the user's vitory-xbox (`VICTORY_PRECOMPILED=1`).
+    // The description is the root signature, then (pointer, size) pairs:
+    // render state, input layout, and per stage its code (already in GPU
+    // memory, relocated) and a table of 8-dword entries after a 4-dword
+    // head, whose entry of type 0x43 holds the stage's 16-byte hash. The
+    // hash names the title's own container of that stage (its `XDAT` kind
+    // 0x10 entry), which is translated as usual.
+    // shortcut: behind `VICTORY_PRECOMPILED=1` until the render state
+    // block (0x184 bytes: blend, depth, rasterizer, target formats) and the
+    // input layout block are decoded: without them the host refuses these
+    // graphics pipelines ("graphics state not kept"), and making them cost
+    // frame time for nothing (run `precompiled-20261125-030934`).
+    #[cfg(windows)]
+    if std::env::var_os("VICTORY_PRECOMPILED").is_some_and(|v| v == "1") {
+        let mut hashes: Vec<[u8; 16]> = Vec::new();
+        let mut blocks: Vec<Vec<u8>> = Vec::new();
+        // A 0x1c8 description: the root signature, (state, size), (layout,
+        // size), then stage slots of four words, (code, size, table,
+        // size), at words 5, 9 and 13; an empty slot is four zeros. One
+        // with an empty slot between two stages has its second stage's
+        // table at words 15 and 16 (state blocks of 0x1d0..0x1e8,
+        // `dump-1c8b`), so 17 words are read, and only those pairs: what
+        // follows a description is not its own (scanning 32 words took
+        // other blocks and hashes, and refused those that had built before,
+        // run cfQ). 0x218's (one stage, then other words, and the next one
+        // close behind) are scanned pair by pair over 16 words as before.
+        let mut words = [0u8; 256];
+        let read = !desc.is_null()
+            && (crate::host::read_into(desc, &mut words[..17 * 8]) || crate::host::read_into(desc, &mut words[..128]));
+        if read {
+            let word = |i: usize| u64::from_le_bytes(words[8 * i..8 * i + 8].try_into().unwrap_or_default());
+            let pairs: Vec<usize> = if SLOT == 0x218 {
+                (1..15).collect()
+            } else {
+                let mut p = vec![1, 3];
+                for slot in [5, 9, 13] {
+                    if word(slot) != 0 {
+                        p.extend([slot, slot + 2]);
+                    }
+                }
+                p
+            };
+            for i in pairs {
+                let (at, len) = (word(i) as usize, word(i + 1) as usize);
+                if at <= 0x10000 || !(0x24..=0x2000).contains(&len) {
+                    continue;
+                }
+                let mut block = vec![0u8; len];
+                if !crate::host::read_into(at as *const u8, &mut block) {
+                    continue;
+                }
+                // The render state and the formats and input layout: the
+                // first two blocks.
+                if i <= 3 && i % 2 == 1 {
+                    blocks.push(block.clone());
+                }
+                let dwords: Vec<u32> = block
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_le_bytes(*b))
+                    .collect();
+                // The entries start after a head of 4 dwords (0x1c8's) or
+                // of 6 (0x218's precompiled compute: `0x403, size, ..,
+                // 0x000n0440`, then n entries of type 0x41, the 0x42 ones
+                // and the 0x43 one; dumps `cool_fox-runs\dump-218`). Only
+                // tables, whose first dword is small (0x2, 0x403): code
+                // (`d580...`), state and layout blocks hold 0x43 dwords of
+                // their own, and a code block's gave two to four hashes, and
+                // a refusal, in run cfR (`dump-1c8d`, calls 295 and 300).
+                let starts: &[usize] = if dwords.first().is_some_and(|&d| d < 0x1_0000) { &[4, 6] } else { &[] };
+                for &start in starts {
+                    let mut e = start;
+                    while e + 5 <= dwords.len() {
+                        if dwords[e] == 0x43 {
+                            let mut h = [0u8; 16];
+                            for k in 0..4 {
+                                h[4 * k..4 * k + 4].copy_from_slice(&dwords[e + 1 + k].to_le_bytes());
+                            }
+                            if !hashes.contains(&h) {
+                                hashes.push(h);
+                            }
+                        }
+                        e += 8;
+                    }
+                }
+            }
+        }
+        // A state block with two more register groups (its second dword 6,
+        // not 4): 0x54 bytes more at +0x58, the rest as in the others
+        // (0x1d0, 0x1d8, 0x1e8, 0x200, 0x208 = 0x17c, 0x184, 0x194, 0x1ac,
+        // 0x1b4 with them; compared
+        // dword by dword, `dump-1c8b`). Read without them. (Their depth is
+        // DB_DEPTH_CONTROL's at +0xb8, whose test bit they all set, so
+        // +0x0c, which they hold differently, is not read.)
+        if let Some(state) = blocks.first_mut()
+            && state.len() >= 0xac
+            && state.get(4..8) == Some(&6u32.to_le_bytes()[..])
+            && (0x17c..=0x1b4).contains(&(state.len() - 0x54))
+        {
+            state.drain(0x58..0xac);
+        }
+        // `VICTORY_PRECOMPILED_RANGE=lo-hi` (diagnostics): only the distinct
+        // precompiled pipelines numbered lo..hi in the order first seen are
+        // made, to find one that ends the run.
+        #[cfg(feature = "diagnostics")]
+        let allowed = {
+            static SEEN: std::sync::Mutex<Vec<Vec<[u8; 16]>>> = std::sync::Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            let index = match seen.iter().position(|h| *h == hashes) {
+                Some(i) => i,
+                None => {
+                    seen.push(hashes.clone());
+                    let hex: Vec<String> = hashes.iter().map(|h| h.iter().map(|b| format!("{b:02x}")).collect()).collect();
+                    tracing::info!(index = seen.len() - 1, slot = format_args!("{:#x}", SLOT), "precompiled pipeline first seen: {hex:?}");
+                    seen.len() - 1
+                }
+            };
+            std::env::var("VICTORY_PRECOMPILED_RANGE")
+                .ok()
+                .and_then(|r| {
+                    let (lo, hi) = r.split_once('-')?;
+                    Some((lo.trim().parse::<usize>().ok()?, hi.trim().parse::<usize>().ok()?))
+                })
+                .is_none_or(|(lo, hi)| (lo..hi).contains(&index))
+        };
+        #[cfg(not(feature = "diagnostics"))]
+        let allowed = true;
+        if !hashes.is_empty()
+            && allowed
+            && let Some(hr) = crate::pipeline::create_precompiled(
+                &hashes,
+                // (0x194, 0x19c, 0x1a4: the same registers at the same
+                // offsets, longer at the end; 0x19c and 0x1a4 have three
+                // targets, CB_TARGET_MASK 0xfff: refused calls of runs cfM
+                // and cfN, `cool_fox-runs\dump-1c8`, `dump-1c8b`. Blocks of
+                // 0x1d0, 0x1d8 and 0x1e8 are another layout, CB_COLOR_CONTROL
+                // at +0xd0 instead of +0x7c, and stay refused.)
+                (blocks.len() >= 2 && (0x17c..=0x1b4).contains(&blocks[0].len()))
+                    .then(|| (blocks[0].as_slice(), blocks[1].as_slice())),
+                _iid,
+                out,
+            )
+        {
+            let made = MADE[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
+            if made <= 4 || made.is_power_of_two() {
+                tracing::info!(
+                    slot = format_args!("{:#x}", SLOT),
+                    made,
+                    stages = hashes.len(),
+                    hr = format_args!("{:#x}", hr),
+                    "a precompiled pipeline made from the title's own shaders, found by their hashes"
+                );
+            }
+            return hr;
+        }
+    }
+    // (with `VICTORY_PIPELINE_DUMP`, every one of the first 48 refused
+    // calls of each method: only refused ones come this far)
+    static REFUSED: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+    let refused = REFUSED[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
+    let dumping = cfg!(feature = "diagnostics") && refused <= 48 && std::env::var_os("VICTORY_PIPELINE_DUMP").is_some();
+    if calls <= 4 || calls.is_power_of_two() || dumping {
         // Sixteen 64-bit words at `at`, read through the kernel: neither
         // pointer is known to be mapped.
         #[cfg(windows)]
@@ -388,6 +551,31 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
+        // `VICTORY_PIPELINE_DUMP=<folder>` (diagnostics): the description
+        // and every (pointer, size) pair's bytes in it, to work out what
+        // the two methods are given. Ported from the user's vitory-xbox.
+        #[cfg(all(windows, feature = "diagnostics"))]
+        if dumping
+            && let Some(dir) = std::env::var_os("VICTORY_PIPELINE_DUMP")
+            && let Some(w) = &description
+        {
+            let dir = std::path::PathBuf::from(dir);
+            let _ = std::fs::create_dir_all(&dir);
+            let name = |what: &str| dir.join(format!("{SLOT:#x}-{calls}-{what}.bin"));
+            let mut raw = [0u8; 128];
+            if crate::host::read_into(desc as *const u8, &mut raw) {
+                let _ = std::fs::write(name("desc"), raw);
+            }
+            for (i, pair) in w.windows(2).enumerate() {
+                let (at, len) = (pair[0] as usize, pair[1] as usize);
+                if at > 0x10000 && (1..=1 << 20).contains(&len) {
+                    let mut bytes = vec![0u8; len];
+                    if crate::host::read_into(at as *const u8, &mut bytes) {
+                        let _ = std::fs::write(name(&format!("w{i}-{at:x}-{len:x}")), bytes);
+                    }
+                }
+            }
+        }
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,

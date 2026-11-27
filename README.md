@@ -1,3 +1,5 @@
+> **This is the G6 fork (branch `g6-vt2`).** Start with [G6-FORK.md](G6-FORK.md): how to run the exact build, what it adds, and how to add onto it (people and AI agents).
+
 # Vice-Tay
 
 **Xbox Series compatibility on Windows, tuned on a GeForce RTX 4090.**

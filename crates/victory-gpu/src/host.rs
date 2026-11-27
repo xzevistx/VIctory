@@ -336,11 +336,45 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
     Ok(())
 }
 
+/// Whether new memory is given a residency priority by its use
+/// (`VICTORY_RESIDENCY_PRIORITY=1`; off by default).
+fn priorities_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_RESIDENCY_PRIORITY"))
+}
+
+/// With [`priorities_on`]: what the system keeps on the card first when
+/// this process is over its budget there. High: buffers (the copies of the
+/// title's buffers shaders read and write every frame) and render and depth
+/// targets, which every frame draws into; normal: the rest, mostly textures
+/// the title fills, of which many are read now and then. Over the budget
+/// the system moves memory into the PC's, read over the bus from then on: a
+/// frame that drew into such memory took 290 ms on the card (run cfAK, 98 %
+/// of the budget in use); with these, rarely read textures go there first.
+fn prioritize(device: &ID3D12Device, object: &impl Interface) {
+    if !priorities_on() {
+        return;
+    }
+    let (Ok(resource), Ok(device1)) = (object.cast::<ID3D12Resource>(), device.cast::<ID3D12Device1>()) else {
+        return;
+    };
+    // SAFETY: a live resource of the device's.
+    let desc = unsafe { resource.GetDesc() };
+    let hot = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+        || desc.Flags.0 & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0) != 0;
+    let priority = if hot { D3D12_RESIDENCY_PRIORITY_HIGH } else { D3D12_RESIDENCY_PRIORITY_NORMAL };
+    if let Ok(pageable) = resource.cast::<ID3D12Pageable>() {
+        // SAFETY: one live pageable object and its priority.
+        let _ = unsafe { device1.SetResidencyPriority(1, &Some(pageable), &priority) };
+    }
+}
+
 /// Times, microseconds and the longest of [`mapped`].
 static MAPPED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// New memory (made with [`not_resident`]) is resident when this returns.
 pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> windows::core::Result<()> {
+    prioritize(device, object);
     if !wait_resident() {
         return Ok(());
     }
@@ -941,17 +975,166 @@ pub(crate) fn made_host() -> Option<&'static Host> {
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
-    HOST.get_or_init(|| match create() {
-        Ok(host) => Some(host),
-        Err(e) => {
-            tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
-            None
+    HOST.get_or_init(|| {
+        // Before the title's streaming fills [4 GiB, 2^37) (g6-vt2).
+        crate::upload::claim();
+        match create() {
+            Ok(host) => Some(host),
+            Err(e) => {
+                tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
+                None
+            }
         }
     })
     .as_ref()
 }
 
+/// `VICTORY_PIX=1`: loads PIX on Windows' GPU capturer (the newest
+/// installed under `%ProgramFiles%\Microsoft PIX`) before the device is
+/// made, so that PIX can attach to the running title and take GPU captures
+/// (`pixtool attach <pid> take-capture`), as when PIX launches it.
+fn load_pix_capturer() {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
+    if std::env::var_os("VICTORY_PIX").is_none_or(|v| v != "1") {
+        return;
+    }
+    let root = std::path::PathBuf::from(std::env::var_os("ProgramFiles").unwrap_or_else(|| "C:\\Program Files".into()))
+        .join("Microsoft PIX");
+    // Version folders such as 2611.19: the highest by its numbers.
+    let newest = std::fs::read_dir(&root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path().join("WinPixGpuCapturer.dll"))
+        .filter(|dll| dll.is_file())
+        .max_by_key(|dll| {
+            let version = dll.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()).unwrap_or("");
+            version.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>()
+        });
+    let Some(dll) = newest else {
+        tracing::warn!(folder = %root.display(), "VICTORY_PIX=1, but no PIX GPU capturer is installed there");
+        return;
+    };
+    let wide: Vec<u16> = dll.as_os_str().encode_wide().chain([0]).collect();
+    // SAFETY: a NUL-terminated path.
+    if unsafe { LoadLibraryW(wide.as_ptr()) }.is_null() {
+        let error = std::io::Error::last_os_error();
+        tracing::warn!(dll = %dll.display(), %error, "PIX GPU capturer not loaded");
+    } else {
+        tracing::info!(dll = %dll.display(), "PIX GPU capturer loaded: PIX can attach and take GPU captures");
+        pix_capture_later();
+        pix_capture_key();
+    }
+}
+
+/// A one-frame GPU capture of the next frame to `file`, written by the
+/// capturer itself (its `CaptureNextFrame` export, which `pix3.h`'s
+/// `PIXGpuCaptureNextFrames` calls). `pixtool attach` refuses a process PIX
+/// did not launch, so the title asks for its own captures.
+fn pix_capture(file: &std::path::Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    type CaptureNextFrames = unsafe extern "system" fn(*const u16, u32) -> i32;
+    let module: Vec<u16> = "WinPixGpuCapturer.dll".encode_utf16().chain([0]).collect();
+    // SAFETY: NUL-terminated names; the capturer stays loaded for the process.
+    let start = unsafe {
+        let m = GetModuleHandleW(module.as_ptr());
+        if m.is_null() { None } else { GetProcAddress(m, c"CaptureNextFrame".as_ptr().cast()) }
+    };
+    let Some(start) = start else {
+        tracing::warn!("PIX GPU capturer has no CaptureNextFrame: no capture");
+        return;
+    };
+    let wide: Vec<u16> = file.as_os_str().encode_wide().chain([0]).collect();
+    // SAFETY: the export's signature (pix3.h); a NUL-terminated path.
+    let hr = unsafe { std::mem::transmute::<_, CaptureNextFrames>(start)(wide.as_ptr(), 1) };
+    tracing::info!(file = %file.display(), hr = format_args!("{hr:#010x}"), "PIX GPU capture of the next frame asked for");
+}
+
+/// `VICTORY_PIX_CAPTURE_AT=<seconds>` (with `VICTORY_PIX=1`): a capture
+/// that many seconds after the device is made, to `VICTORY_PIX_CAPTURE_FILE`,
+/// else `victory-<seconds>s.wpix` in the working directory.
+/// `VICTORY_PIX_CAPTURE_FRAME=<n>` instead: when the title reaches frame `n`
+/// (`crate::frame::current`), however long that takes. A run with the
+/// capturer loaded is slower by an amount that varies, so a time names a
+/// different scene from run to run; a frame number names the same one.
+fn pix_capture_later() {
+    let number = |name: &str| std::env::var(name).ok().and_then(|s| s.trim().parse::<u64>().ok());
+    let (at, frame) = (number("VICTORY_PIX_CAPTURE_AT"), number("VICTORY_PIX_CAPTURE_FRAME"));
+    if at.is_none() && frame.is_none() {
+        return;
+    }
+    let file = std::env::var_os("VICTORY_PIX_CAPTURE_FILE").map(std::path::PathBuf::from).unwrap_or_else(|| {
+        match frame {
+            Some(n) => format!("victory-frame-{n}.wpix"),
+            None => format!("victory-{}s.wpix", at.unwrap_or(0)),
+        }
+        .into()
+    });
+    let spawned = std::thread::Builder::new().name("victory-pix-capture".into()).spawn(move || {
+        match frame {
+            Some(n) => {
+                while crate::frame::current() < n {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+            None => std::thread::sleep(std::time::Duration::from_secs(at.unwrap_or(0))),
+        }
+        pix_capture(&file);
+    });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "no thread for the PIX capture");
+    }
+}
+
+/// With `VICTORY_PIX=1`: F11, while a window of this process is in front,
+/// captures the next frame to `VICTORY_PIX_DIR` (else the working
+/// directory) as `victory-<unix seconds>.wpix`. Once per 20 s: a capture of
+/// the world is about 2 GB and takes PIX a while to write.
+/// shortcut: the title still sees F11 too (G6's console build reads no
+/// function keys).
+fn pix_capture_key() {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F11};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    let dir = std::env::var_os("VICTORY_PIX_DIR").map(std::path::PathBuf::from).unwrap_or_default();
+    let spawned = std::thread::Builder::new().name("victory-pix-key".into()).spawn(move || {
+        let mut last: Option<std::time::Instant> = None;
+        let mut was_down = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            // SAFETY: plain queries.
+            let down = unsafe { GetAsyncKeyState(i32::from(VK_F11)) } < 0;
+            let pressed = down && !was_down;
+            was_down = down;
+            if !pressed || last.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(20)) {
+                continue;
+            }
+            let mut owner = 0u32;
+            // SAFETY: plain queries; a null window gives process 0.
+            unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut owner) };
+            if owner != std::process::id() {
+                continue;
+            }
+            last = Some(std::time::Instant::now());
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            pix_capture(&dir.join(format!("victory-{secs}.wpix")));
+        }
+    });
+    match spawned {
+        Ok(_) => tracing::info!("PIX: F11 in the game window captures the next frame"),
+        Err(e) => tracing::warn!(error = %e, "no thread for the PIX capture key"),
+    }
+}
+
 fn create() -> windows::core::Result<Host> {
+    // PIX's GPU capturer before any device (`VICTORY_PIX=1`).
+    load_pix_capturer();
+    // Before anything loads D3D12's runtime (the debug layer and the
+    // crash tracing below do).
+    agility_choose();
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
@@ -1014,6 +1197,7 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        agility_log(&device);
         // Before anything is made with it (`VICTORY_RECORD`).
         #[cfg(feature = "diagnostics")]
         crate::replay::record::from_env(&device);
@@ -1034,8 +1218,31 @@ fn create() -> windows::core::Result<Host> {
                 None,
                 None,
             );
-            tracing::info!(ok = set.is_ok(), "the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)");
+            match set {
+                Ok(()) => tracing::info!("the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)"),
+                // (The runtime takes it only in Windows' developer mode.)
+                Err(e) => tracing::warn!(
+                    error = format_args!("{:#010x} {}", e.code().0, e.message()),
+                    "the host's background shader work could not be switched off (VICTORY_D3D12_BACKGROUND=0)"
+                ),
+            }
         }
+        // `VICTORY_D3D12_BACKGROUND_LOW=1`: the runtime's "D3D Background
+        // Thread"s run at the lowest priority, so that the driver compiles
+        // shaders again only on cores nobody else wants. They took some two
+        // cores' worth a frame in the world on a 6-core CPU (run cfZ: 126 ms
+        // a frame of 57), while threads ready to run waited for a core for
+        // 17.5 % of all frame time; switching the work off
+        // (`VICTORY_D3D12_BACKGROUND=0`) needs Windows' developer mode
+        // (0x887a002d without it, run cfAB).
+        if crate::switch::on("VICTORY_D3D12_BACKGROUND_LOW") {
+            background_threads_low();
+        }
+        // A test (`VICTORY_VRAM_HOG_MB=<n>`): `n` MB of the card held for the
+        // whole run, as another program's would be, to see what the run does
+        // when the system's budget for it shrinks (run cfAK: the budget went
+        // from 11,244 to about 8,900 MB, 98 % in use, 2.5 fps).
+        vram_hog(&device);
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32
         let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
@@ -1116,6 +1323,201 @@ impl Host {
         // SAFETY: a plain query.
         adapter.map_or(0, |a| unsafe { a.CheckInterfaceSupport(&IDXGIDevice::IID) }.unwrap_or(0))
     }
+}
+
+/// `VICTORY_VRAM_HOG_MB`: buffers of the card's own memory, that many MB,
+/// made at start and kept, as another program's would be (a test).
+fn vram_hog(device: &ID3D12Device) {
+    static HELD: std::sync::Mutex<Vec<ID3D12Resource>> = std::sync::Mutex::new(Vec::new());
+    let Some(mb) = std::env::var("VICTORY_VRAM_HOG_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()) else {
+        return;
+    };
+    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+    let mut left = mb << 20;
+    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    while left > 0 {
+        let size = left.min(256 << 20);
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a buffer nothing uses.
+        let made = unsafe {
+            device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+        };
+        match (made, buffer) {
+            (Ok(()), Some(b)) => {
+                // Held like memory another program draws with every frame:
+                // the system moves ours off the card first.
+                if let (Ok(device1), Ok(pageable)) = (device.cast::<ID3D12Device1>(), b.cast::<ID3D12Pageable>()) {
+                    // SAFETY: one live pageable object and its priority.
+                    let _ = unsafe { device1.SetResidencyPriority(1, &Some(pageable), &D3D12_RESIDENCY_PRIORITY_MAXIMUM) };
+                }
+                held.push(b)
+            }
+            _ => break,
+        }
+        left -= size;
+    }
+    tracing::info!(asked_mb = mb, held_mb = (mb - (left >> 20)), "card memory held for the run (VICTORY_VRAM_HOG_MB, a test)");
+}
+
+/// Whether a thread's name is one of the D3D runtime's background threads.
+fn is_background_thread(name: &str) -> bool {
+    name.starts_with("D3D Background Thread")
+}
+
+/// Puts the runtime's background threads ([`is_background_thread`]) of this
+/// process at the lowest priority, now and every 2 s from a thread of its
+/// own (the runtime starts them as it goes). Each thread is lowered once.
+fn background_threads_low() {
+    std::thread::Builder::new()
+        .name("victory-bg-low".into())
+        .spawn(|| {
+            use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+            use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+            };
+            use windows_sys::Win32::System::Threading::{
+                GetCurrentProcessId, GetThreadDescription, OpenThread, SetThreadPriority, THREAD_PRIORITY_LOWEST,
+                THREAD_QUERY_LIMITED_INFORMATION, THREAD_SET_LIMITED_INFORMATION,
+            };
+            let mut lowered = std::collections::HashSet::new();
+            loop {
+                // SAFETY: plain system calls on this process's threads; the
+                // handles opened are closed, the name freed.
+                unsafe {
+                    let pid = GetCurrentProcessId();
+                    let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                    if snap != INVALID_HANDLE_VALUE {
+                        let mut entry: THREADENTRY32 = std::mem::zeroed();
+                        entry.dwSize = size_of::<THREADENTRY32>() as u32;
+                        let mut more = Thread32First(snap, &mut entry) != 0;
+                        while more {
+                            let id = entry.th32ThreadID;
+                            if entry.th32OwnerProcessID == pid && !lowered.contains(&id) {
+                                let thread =
+                                    OpenThread(THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_LIMITED_INFORMATION, 0, id);
+                                if !thread.is_null() {
+                                    let mut name: windows_sys::core::PWSTR = std::ptr::null_mut();
+                                    if GetThreadDescription(thread, &mut name) >= 0 && !name.is_null() {
+                                        let n = (0..).take_while(|&i| *name.add(i) != 0).count();
+                                        let text = String::from_utf16_lossy(std::slice::from_raw_parts(name, n));
+                                        windows_sys::Win32::Foundation::LocalFree(name.cast());
+                                        if is_background_thread(&text) && SetThreadPriority(thread, THREAD_PRIORITY_LOWEST) != 0 {
+                                            lowered.insert(id);
+                                            tracing::info!(thread = id, name = %text, "a D3D background thread put at the lowest priority (VICTORY_D3D12_BACKGROUND_LOW=1)");
+                                        }
+                                    }
+                                    CloseHandle(thread);
+                                }
+                            }
+                            more = Thread32Next(snap, &mut entry) != 0;
+                        }
+                        CloseHandle(snap);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        })
+        .ok();
+}
+
+/// The SDK version of the Agility runtime the device was made with, when
+/// one was asked for and taken ([`agility_choose`]); 0: the system's.
+static AGILITY_SDK: AtomicU32 = AtomicU32::new(0);
+
+/// The Agility runtime's SDK version in use, if one is (the pipeline
+/// library keeps a file per runtime: one made by another is refused).
+pub(crate) fn agility_sdk() -> Option<u32> {
+    let v = AGILITY_SDK.load(Ordering::Relaxed);
+    (v != 0).then_some(v)
+}
+
+/// The DirectX 12 Agility SDK's runtime in `D3D12\` beside the executable
+/// (`apps/victory/build.rs` puts it there with `sdk-version.txt`), taken
+/// only with `VICTORY_AGILITY=1`, through `ID3D12SDKConfiguration`, which
+/// a preview SDK accepts with Windows' developer mode on. Not by default
+/// (2026-11-27): with the system's runtime the pipeline library of earlier
+/// runs (933 MB, 1,291 pipelines loaded at the start) was refused under the
+/// 1.722 preview ("created for a different version of the driver"), every
+/// pipeline was compiled again and the start took longer behind a black
+/// screen; and the preview's ray tracing additions need a driver this
+/// card does not have yet.
+fn agility_choose() {
+    if !std::env::var_os("VICTORY_AGILITY").is_some_and(|v| v == "1") {
+        return;
+    }
+    let dir = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("D3D12")));
+    let version = dir
+        .as_ref()
+        .and_then(|d| std::fs::read_to_string(d.join("sdk-version.txt")).ok())
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    let Some(version) = version else {
+        tracing::warn!("VICTORY_AGILITY=1, but no Agility runtime beside the executable: the system's is used");
+        return;
+    };
+    // SAFETY: plain calls, before any device is made.
+    let taken = unsafe {
+        let mut config: Option<ID3D12SDKConfiguration> = None;
+        D3D12GetInterface(&CLSID_D3D12SDKConfiguration, &mut config)
+            .and_then(|()| config.ok_or_else(windows::core::Error::empty))
+            .and_then(|c| c.SetSDKVersion(version, windows::core::s!(".\\D3D12\\")))
+    };
+    match taken {
+        Ok(()) => {
+            AGILITY_SDK.store(version, Ordering::Relaxed);
+            tracing::info!(version, "the Agility SDK's runtime beside the executable is used (VICTORY_AGILITY=1)");
+        }
+        Err(e) => tracing::warn!(error = %e, version, "the Agility SDK's runtime was not taken: the system's is used"),
+    }
+}
+
+/// Which D3D12 runtime the device came from, and whether it and the card
+/// have the DirectX Raytracing additions of the Agility SDK 1.722 preview
+/// (clustered geometry, partitioned top-level structures, structures built
+/// from arguments the card writes: `D3D12_FEATURE_D3D12_OPTIONS_RAYTRACING2`,
+/// 75, which older runtimes refuse). The executable asks for SDK 722 from
+/// `D3D12\` beside it when it was built with the SDK there
+/// (`apps/victory/build.rs`); without the files, or without Windows'
+/// developer mode, which a preview SDK needs, the system's runtime is used.
+#[cfg(windows)]
+fn agility_log(device: &ID3D12Device) {
+    let sdk = device
+        .cast::<ID3D12DeviceConfiguration>()
+        .ok()
+        // SAFETY: a plain query.
+        .map(|c| unsafe { c.GetDesc() }.SDKVersion);
+    let mut tier = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+    // SAFETY: a plain query into a struct of its size.
+    let rt = unsafe {
+        device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, (&raw mut tier).cast(), size_of_val(&tier) as u32)
+    }
+    .is_ok()
+    .then_some(tier.RaytracingTier.0);
+    // D3D12_FEATURE_DATA_D3D12_OPTIONS_RAYTRACING2 { ClustersAndPTLASSupported, TemplateInstancePrefersCOMPRESSED1 }
+    let mut rt2 = [0i32; 2];
+    // SAFETY: a plain query into a struct of its size.
+    let clusters = unsafe { device.CheckFeatureSupport(D3D12_FEATURE(75), rt2.as_mut_ptr().cast(), 8) }
+        .is_ok()
+        .then_some(rt2[0] != 0);
+    tracing::info!(
+        sdk = sdk.unwrap_or(0),
+        raytracing_tier = rt.unwrap_or(0),
+        clusters_and_partitioned_tlas = format_args!("{}", match clusters {
+            Some(true) => "supported",
+            Some(false) => "not by this card or driver",
+            None => "not known to this runtime",
+        }),
+        "D3D12 runtime"
+    );
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
@@ -1323,6 +1725,9 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Scratch memory on the card for the host's ray-tracing structure
+    /// builds (`crate::dxr`) and its size, used from its start by each.
+    pub(crate) structure_scratch: Mutex<Option<(ID3D12Resource, u64)>>,
     /// Scratch buffers of the batched clamps (`crate::indirect::batch`), and
     /// how many batches of this recording have a place in them.
     batch_args: Mutex<(Vec<ID3D12Resource>, u32)>,
@@ -4249,8 +4654,9 @@ impl RelayBack {
             }
         }
         land::spent(land::stat::BACK, merging);
-        for ((_, from, to), written) in self.work.iter().zip(written) {
+        for ((shadow, from, to), written) in self.work.iter().zip(written) {
             COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
+            crate::shadow::note_back(shadow, written as usize, shadow.carded());
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written as usize);
             let _ = (from, to);
@@ -4883,6 +5289,7 @@ impl Host {
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                structure_scratch: Mutex::default(),
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
@@ -5609,7 +6016,13 @@ impl Host {
                     // SAFETY: the mapping of the fetched bytes, `total` of
                     // them; the copy into it has run, and the next waits
                     // for this call.
-                    merged += unsafe { run[0].0.land_card(addressed, after, &mut notes) };
+                    let landed = if crate::shadow::back_skipped(&run[0].0) {
+                        0
+                    } else {
+                        unsafe { run[0].0.land_card(addressed, after, &mut notes) }
+                    };
+                    crate::shadow::note_back(&run[0].0, landed as usize, true);
+                    merged += landed;
                 }
                 notes.flush();
                 put.fetch_add(merged, Ordering::Relaxed);
@@ -5923,6 +6336,7 @@ impl Host {
         }
         for (r, written) in plan.ranges.iter().zip(written) {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            crate::shadow::note_back(&r.shadow, written as usize, true);
             let (from, to) = r.declared;
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(from, to - from, written);
@@ -9602,7 +10016,12 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             read_pieces(at, to, remaining);
             break;
         }
-        if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
+        if info.State != MEM_COMMIT && crate::watch::lazy_on() {
+            // A placeholder may be lazy pages of a GPU page-mapping copy
+            // (`VICTORY_LAZY_ALIAS=1`): read by the piece, through the views
+            // that show their pages; zeros where nothing does.
+            read_pieces(at, to, n);
+        } else if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
@@ -9655,6 +10074,15 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
+/// [`read_into`] of the addresses themselves: a lazy page of a GPU
+/// page-mapping copy (`VICTORY_LAZY_ALIAS=1`) is not there. For the
+/// questions whether memory is there to be read in place (a lazy page read
+/// in place faulted, run cfX), where [`read_into`] would answer for the view
+/// that stands in for it.
+pub(crate) fn read_into_raw(src: *const u8, dst: &mut [u8]) -> bool {
+    read_count(src, dst.as_mut_ptr(), dst.len()) == dst.len()
+}
+
 /// Reads what is there of the `dst.len()` bytes of title memory at `src`,
 /// zeros for the rest; returns how many bytes were there. Safe while the
 /// runtime remaps title memory (the kernel, or a copy that takes the fault,
@@ -9697,12 +10125,38 @@ pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
-/// readable.
+/// readable. A page that is a lazy page of a GPU page-mapping copy
+/// (`VICTORY_LAZY_ALIAS=1`) is read through a view that shows the same
+/// physical page, so that it needs no view of its own; mapped only where no
+/// such view is there.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
-    read_count(src, dst, len) == len
+    if read_count(src, dst, len) == len {
+        return true;
+    }
+    if !crate::watch::lazy_on() {
+        return false;
+    }
+    let mut whole = true;
+    for_pieces(src as usize, len, 64 << 10, |at, n| {
+        let to = dst.wrapping_add(at - src as usize);
+        if read_count(at as *const u8, to, n) == n {
+            return;
+        }
+        let redirected = crate::watch::lazy_source(at)
+            .is_some_and(|from| read_count(from as *const u8, to, n) == n);
+        if redirected {
+            crate::watch::lazy_counted(0);
+        } else if crate::watch::map_lazy(at, n) && read_count(at as *const u8, to, n) == n {
+            crate::watch::lazy_counted(1);
+        } else {
+            whole = false;
+        }
+    });
+    whole
 }
 
-/// Number of bytes transferred before a failed title-memory access.
+/// Number of bytes transferred before a failed title-memory access
+/// (without lazy pages: [`read`]).
 fn read_count(src: *const u8, dst: *mut u8, len: usize) -> usize {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -9774,8 +10228,36 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     if len == 0 || write(dst as usize, len) {
         return;
     }
+    // A lazy page of a GPU page-mapping copy (`VICTORY_LAZY_ALIAS=1`) is
+    // written through a view of the same physical page (its guards opened
+    // first, as the caller did for `dst`), or mapped where there is none.
+    let lazy = |at: usize, n: usize| -> bool {
+        if !crate::watch::lazy_on() {
+            return false;
+        }
+        let from = src.wrapping_add(at - dst as usize);
+        if let Some(to) = crate::watch::lazy_source(at) {
+            crate::watch::writing(to, n);
+            // SAFETY: as `write`: the source is ours, the destination is
+            // checked by the copy or the kernel.
+            let ok = if crate::safecopy::on() {
+                unsafe { crate::safecopy::copy(to as *mut u8, from, n) }
+            } else {
+                let mut done = 0;
+                unsafe { NtWriteVirtualMemory(GetCurrentProcess(), to as _, from.cast(), n, &mut done) >= 0 }
+            };
+            if ok {
+                crate::watch::lazy_counted(2);
+                return true;
+            }
+        }
+        crate::watch::map_lazy(at, n) && write(at, n) && {
+            crate::watch::lazy_counted(1);
+            true
+        }
+    };
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
+        if !write(at, n) && !lazy(at, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
                 if write(at, n) {
                     return;
@@ -10064,6 +10546,7 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
+        crate::fpsbox::presented();
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
@@ -10078,6 +10561,8 @@ impl Meter {
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
+        crate::fpsbox::set(fps);
+        crate::fpsbox::set_frame(draws, ms);
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // The lines (every second, and more every 5 s: sorting, system
         // calls, some forty lines written) are made by a thread of ours
@@ -10103,6 +10588,28 @@ impl Meter {
                 COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
             });
             let dropped = crate::draw::take_dropped() as f64 / frames;
+            crate::fpsbox::set_detail(cpu, gpu, dropped, crate::pipeline::making() as f64);
+            // The panel's lines of where a frame's time and memory go (g6-vt2):
+            // per frame, texture uploads, title buffers copied to the card and
+            // what is copied back; the card's memory against its budget and
+            // what spilled into the PC's; per second, streaming and the GPU's
+            // page-mapping copies.
+            {
+                let secs = (frames * ms / 1000.0).max(0.001);
+                let [streamed, requests, page_copies, page_us] = crate::fpsbox::take_notes();
+                let mut more = vec![
+                    format!("TEX UP {texture_mb:.1} MB {texture_ms:.0} MS"),
+                    format!("COPY {copy_mb:.0} MB {copy_ms:.0} MS"),
+                    format!("BACK {back_mb:.1} MB {back_ms:.0} MS"),
+                ];
+                if let Some([budget, used, _, shared]) = host().and_then(|h| h.video_memory()) {
+                    more.push(format!("VRAM {}/{} PC {}", used >> 20, budget >> 20, shared >> 20));
+                }
+                more.push(format!("STREAM {:.0} MB/S {:.0}/S", streamed as f64 / 1e6 / secs, requests as f64 / secs));
+                more.push(format!("PAGEMAP {:.0}/S {:.0} MS", page_copies as f64 / secs, page_us as f64 / 1000.0 / secs));
+                crate::fpsbox::set_more(more);
+            }
+            peek_title();
             let indirect = crate::list::take_indirect() as f64 / frames;
             let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
             let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
@@ -10514,9 +11021,11 @@ impl Host {
             // read back at once (a saved or listed frame): then a list of
             // its own, one whose last flight has finished or a new one.
             #[cfg(feature = "diagnostics")]
-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            let save_frame = crate::capture::wanted(frame);
+            #[cfg(feature = "diagnostics")]
+            let read_now = save_frame || crate::capture::listed(frame) || present_sync(frame);
             #[cfg(not(feature = "diagnostics"))]
-            let read_now = false;
+            let read_now = present_sync(frame);
             let game_ui = if p.framegen && planes.is_some() && !read_now {
                 if p.game_ui.as_ref().is_none_or(|ui| ui.size != (width, height)) {
                     p.game_ui = crate::compose::UiFrames::new(self, (width, height));
@@ -10630,10 +11139,13 @@ impl Host {
                 list.ResourceBarrier(&pre);
                 list.CopyResource(&back, texture);
             }
+            // The frame rate panel (F10), into the corner of what is shown;
+            // saved frames are then taken from what is shown, panel and all.
+            crate::fpsbox::draw(self, list, &back, (width, height, format));
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
+            let capture = save_frame
                 .then(|| {
-                    if composed {
+                    if composed || crate::fpsbox::drawn() {
                         list.ResourceBarrier(&[transition(
                             &back,
                             D3D12_RESOURCE_STATE_COPY_DEST,
@@ -10715,6 +11227,7 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
+            present_pause(frame);
             let mut showing = crate::timeline::span("the host's Present");
             let status = if p.framegen {
                 #[cfg(feature = "diagnostics")]
@@ -10840,6 +11353,8 @@ fn title_window() -> Option<HWND> {
             GetWindowThreadProcessId(hwnd, Some(&mut process));
             if process == windows::Win32::System::Threading::GetCurrentProcessId()
                 && IsWindowVisible(hwnd).as_bool()
+                && !is_victory_window(hwnd)
+                && !is_console_window(hwnd)
             {
                 *(found.0 as *mut Option<HWND>) = Some(hwnd);
                 return false.into();
@@ -10851,6 +11366,28 @@ fn title_window() -> Option<HWND> {
     // SAFETY: the callback only writes `found`, which outlives the call.
     let _ = unsafe { EnumWindows(Some(visit), LPARAM(&raw mut found as isize)) };
     found
+}
+
+/// Whether `hwnd` is the console's window this process was started from
+/// (classic or pseudo console). Its process is ours too, so before the
+/// title made its own window the swap chain went to the terminal, and the
+/// title's "Americas" window stayed black.
+fn is_console_window(hwnd: HWND) -> bool {
+    let mut class = [0u16; 64];
+    // SAFETY: a window handle and a buffer of ours.
+    let n = unsafe { windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut class) };
+    let class = String::from_utf16_lossy(&class[..n.max(0) as usize]);
+    class == "ConsoleWindowClass" || class == "PseudoConsoleWindow" || class.starts_with("CASCADIA_HOSTING")
+}
+
+/// Whether `hwnd` is one of VIctory's own windows (class "Victory...": the
+/// start-up splash), which the title's picture must not go to (bound to the
+/// splash, the swap chain showed a white window).
+fn is_victory_window(hwnd: HWND) -> bool {
+    let mut class = [0u16; 64];
+    // SAFETY: a window handle and a buffer of ours.
+    let n = unsafe { windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut class) };
+    String::from_utf16_lossy(&class[..n.max(0) as usize]).starts_with("Victory")
 }
 
 /// `state` without the bits the host texture's flags forbid: the console
@@ -12394,4 +12931,58 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
     }
+}
+
+
+/// `VICTORY_PEEK=<hex address>:<bytes>[,...]` (a diagnostic): title memory
+/// there, logged once a second as bytes (what the title holds, not the
+/// card's copy). For small tables a pass reads, such as tone curves.
+fn peek_title() {
+    static LIST: std::sync::OnceLock<Vec<(u64, usize)>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_PEEK")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|e| {
+                let (a, n) = e.trim().split_once(':')?;
+                Some((u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()?, n.parse().ok()?))
+            })
+            .collect()
+    });
+    for &(at, n) in list {
+        let mut bytes = vec![0u8; n.min(4096)];
+        copy_mapped(bytes.as_mut_ptr(), at as *const u8, bytes.len(), false);
+        let text: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        tracing::info!(at = format_args!("{at:#x}"), "title bytes (VICTORY_PEEK): {}", text.join(""));
+    }
+}
+
+/// `VICTORY_PRESENT_PAUSE=<every>:<ms>` (an experiment): every `every`-th
+/// frame the presenting thread sleeps `ms` before Present. Saving a frame
+/// every 8th frame did the same by accident and kept the grading free of
+/// banding; this finds out whether the pause alone does it.
+fn present_pause(frame: u64) {
+    static SET: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    let set = SET.get_or_init(|| {
+        let v = std::env::var("VICTORY_PRESENT_PAUSE").ok()?;
+        let (e, ms) = v.split_once(':')?;
+        Some((e.parse().ok().filter(|&e: &u64| e > 0)?, ms.parse().ok()?))
+    });
+    if let Some((every, ms)) = *set
+        && frame % every == 0
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
+/// `VICTORY_PRESENT_SYNC=<every>`: every `every`-th frame's present is sent
+/// at once and waited for, settling everything in the air (as a saved frame
+/// is). Build 879C saved every 8th frame that way, and those settles are what
+/// kept its colour grading free of banding.
+fn present_sync(frame: u64) -> bool {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let every = *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_PRESENT_SYNC").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    every > 0 && frame % every == 0
 }

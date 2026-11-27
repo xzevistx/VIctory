@@ -39,6 +39,28 @@ const PAGE: usize = 4096;
 /// About this many bytes to a job.
 const JOB: usize = 256 << 10;
 
+/// Diagnostics: pieces landed through the title's own address, by why:
+/// the remapping lock was taken, no view holds it, views hold a part, views
+/// of more than one place hold it, one run but no view of ours.
+#[cfg(feature = "diagnostics")]
+fn why_direct(why: usize) {
+    static WHY: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    let n = WHY[why].fetch_add(1, Ordering::Relaxed) + 1;
+    let all: u64 = WHY.iter().map(|w| w.load(Ordering::Relaxed)).sum();
+    if all >= 1024 && all.is_power_of_two() {
+        tracing::info!(
+            "pieces landed through the title's own address, since the start: {} the remapping lock was taken, {} no view \
+             holds it, {} views hold a part, {} views of more than one place, {} one run but no view of ours",
+            WHY[0].load(Ordering::Relaxed),
+            WHY[1].load(Ordering::Relaxed),
+            WHY[2].load(Ordering::Relaxed),
+            WHY[3].load(Ordering::Relaxed),
+            WHY[4].load(Ordering::Relaxed)
+        );
+    }
+    let _ = n;
+}
+
 /// See the file.
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -504,7 +526,30 @@ pub(crate) struct Notes {
     /// Per piece put beside the guards, all of it: its 64 KiB block and the
     /// copy it was landed through (which the job holds until the flush).
     landed: Vec<(usize, *const crate::shadow::Shadow)>,
+    /// Blocks of `landed` put through the title's own address into
+    /// write-watched memory ([`watched`]).
+    watched: Vec<usize>,
 }
+
+/// Whether write-watched title memory (the title's own allocations, which
+/// no view of ours shows: two thirds of what lands, run cfAH) is landed as
+/// beside the guards (`VICTORY_LAND_WATCHED=1`; off by default). Its pages
+/// are asked first (what the title wrote is noted), the landing is put
+/// through the title's address, their dirty bits are cleared, and the
+/// pages are noted as written by us ([`crate::watch::landed_beside`]); the
+/// copy landed through is up to date with them where title memory and the
+/// copy are alike (`crate::shadow::Shadow::landed_watched`). Before, the
+/// landing's own write was the title's to the next asking, and every copy,
+/// that one too, read the pages back and sent them up again (run cfAG3: 67 %
+/// of the landed pages our refreshes touched).
+fn watched() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_WATCHED").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line: pieces landed as [`watched`] says, and
+/// those of them the copy was found alike with.
+static WATCHED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 // SAFETY: the pointers are used by the job that has the notes, in `flush`.
 unsafe impl Send for Notes {}
@@ -552,13 +597,19 @@ impl Notes {
                 if !copy.is_null() && through.all(|other| other == copy) {
                     // SAFETY: the job holds its copies until this is done.
                     let copy = unsafe { &*copy };
-                    TAKEN[1].fetch_add(u64::from(copy.landed(block, before, now)), Ordering::Relaxed);
+                    let held = if self.watched.contains(&block) {
+                        copy.landed_watched(block, before, now)
+                    } else {
+                        copy.landed(block, before, now)
+                    };
+                    TAKEN[1].fetch_add(u64::from(held), Ordering::Relaxed);
                 }
             }
         }
         self.pages.clear();
         self.spans.clear();
         self.landed.clear();
+        self.watched.clear();
         spent(stat::NOTES, noting);
     }
 }
@@ -607,13 +658,30 @@ unsafe fn piece_at(
     // a change is under way, what the record of the views says now does
     // ([`anytime`]), or the title's own address.
     let reading = beside.then(crate::watch::title_memory_reading_now).flatten();
-    let beside = if reading.is_some() || beside && anytime() { crate::inplace::beside(title, end) } else { None };
+    let tried = reading.is_some() || beside && anytime();
+    let beside_on = beside;
+    let beside = if tried { crate::inplace::beside(title, end) } else { None };
+    // Diagnostics: why a piece went through the title's own address.
+    #[cfg(feature = "diagnostics")]
+    if beside_on && beside.is_none() {
+        why_direct(if !tried { 0 } else {
+            match crate::inplace::cover(title, end) {
+                crate::inplace::Cover::None => 1,
+                crate::inplace::Cover::Holes => 2,
+                crate::inplace::Cover::Scattered => 3,
+                crate::inplace::Cover::Run(..) => 4,
+            }
+        });
+    }
+    let _ = beside_on;
     count(stat::PIECES, 1);
     count(if beside.is_some() { stat::BESIDE } else { stat::DIRECT }, 1);
     // The pages that differ, before any is written: none, and the guard
     // stays; else it is opened once for the piece.
     let mut differing = [true; BLOCK / PAGE + 1];
     let base = title / PAGE;
+    // Write-watched memory landed as beside the guards ([`watched`]).
+    let mut by_watch = false;
     if beside.is_none() {
         drop(reading);
         differing.fill(false);
@@ -630,7 +698,12 @@ unsafe fn piece_at(
         let last = differing.iter().rposition(|&d| d).unwrap_or(first);
         let (from, to) = (((base + first) * PAGE).max(title), ((base + last + 1) * PAGE).min(title + end));
         let opening = std::time::Instant::now();
-        crate::watch::landing(from, to - from);
+        // Write-watched memory (no guard there): its pages asked first, so
+        // that what the title wrote is in the journal before ours goes in.
+        by_watch = watched() && !copy.is_null() && !crate::watch::guarded(from, to) && crate::watch::writes(from, to, false).is_some();
+        if !by_watch {
+            crate::watch::landing(from, to - from);
+        }
         spent(stat::NOTES, opening);
     }
     let into = beside.unwrap_or(title);
@@ -669,7 +742,10 @@ unsafe fn piece_at(
         missing += u64::from(!done.there);
         if done.new > 0 {
             new_pages += 1;
-            if beside.is_some() {
+            // Diagnostics: does the title read what was put back?
+            #[cfg(feature = "diagnostics")]
+            crate::landwatch::landed(title + from, n);
+            if beside.is_some() || by_watch {
                 let page = (title + from) / PAGE;
                 // (Two parts in one page.)
                 if notes.pages.last() != Some(&page) {
@@ -680,12 +756,36 @@ unsafe fn piece_at(
             }
         }
     });
+    // Write-watched memory: our own write is no write of the title's (its
+    // dirty bits cleared), and the copy is up to date with the pages only if
+    // title memory holds what the copy does there: a write of the title's
+    // since the asking shows as a difference (then the copy is not noted,
+    // and takes the pages again at its next refresh, as every other copy
+    // does once the pages are noted as written).
+    let mut alike = true;
+    if by_watch && let Some((from, to)) = span {
+        crate::watch::reset_written(from, to);
+        let mut title_bytes = vec![0u8; PAGE];
+        let mut at = from;
+        while at < to && alike {
+            let n = (to - at).min(PAGE - at % PAGE);
+            // SAFETY: inside the piece: `held` is ours up to the last part's end.
+            let ours = unsafe { std::slice::from_raw_parts(held.add(at - title).cast_const(), n) };
+            alike = crate::host::read_into_raw(at as *const u8, &mut title_bytes[..n]) && title_bytes[..n] == *ours;
+            at += n;
+        }
+        WATCHED[0].fetch_add(1, Ordering::Relaxed);
+        WATCHED[1].fetch_add(u64::from(alike), Ordering::Relaxed);
+    }
     if let Some((from, to)) = span {
         notes.spans.push((from, to - from));
         // Not through a copy that is not to be noted, if that is asked: the
         // block then has two.
-        let through = if missing == 0 { copy } else { std::ptr::null() };
+        let through = if missing == 0 && alike { copy } else { std::ptr::null() };
         notes.landed.push((title / BLOCK, through));
+        if by_watch {
+            notes.watched.push(title / BLOCK);
+        }
     }
     count(stat::NEW_PIECES, u64::from(new_pages > 0));
     count(stat::PAGES, pages);

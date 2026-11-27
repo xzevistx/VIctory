@@ -38,6 +38,10 @@ pub(crate) struct Pending {
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    /// The host pipeline for the console's rectangles, made the first time
+    /// a rectangle draw asks for it while `made` has no rectangle geometry
+    /// stage ([`ready_rects`]; Ported from the user's vitory-xbox (`VICTORY_PRECOMPILED=1`).)
+    rects: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
@@ -140,6 +144,7 @@ impl Pending {
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
+            rects: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
@@ -257,6 +262,27 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
+}
+
+/// As [`ready`], for a draw of the console's rectangles: a graphics
+/// pipeline made without the rectangle geometry stage (a precompiled one,
+/// whose layout names triangles) gets a second host pipeline with it, made
+/// on this thread the first time. Without it each rectangle would be drawn
+/// as its first triangle, half of it.
+pub(crate) fn ready_rects(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    let base = ready(p)?;
+    if base.rects || base.compute || base.mesh {
+        return Some(base);
+    }
+    let Some(g) = p.graphics.as_deref() else {
+        return Some(base);
+    };
+    let made = p.rects.get_or_init(|| {
+        let made = HostPipeline::new(&p.shaders, Some(&g.as_rectangles())).filter(|r| r.rects);
+        tracing::info!(shaders = ?p.shaders, made = made.is_some(), "rectangle form of a pipeline");
+        made
+    });
+    Some(made.as_ref().unwrap_or(base))
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -732,6 +758,7 @@ mod tests {
                 ambient: None,
                 probe: None,
                 translated: OnceLock::from(None),
+                clamped: OnceLock::new(),
             })
         };
         let skips = super::super::parse_skip_hashes("32ed072b9f845048");

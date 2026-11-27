@@ -14,6 +14,8 @@ victory-loader.workspace = true
 victory-hle.workspace = true
 victory-shader = { workspace = true, features = ["host"] }
 victory-game.workspace = true
+# The precompiled pipelines' shader finder (`run.rs`, `VICTORY_PRECOMPILED=1`; cool_fox patch 2026-11-27).
+victory-gpu.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 memchr.workspace = true

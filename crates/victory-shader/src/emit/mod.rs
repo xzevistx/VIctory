@@ -119,7 +119,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
+pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave, with_export_clamp};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -549,6 +549,28 @@ pub fn emit(
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    // A console wave64 compute program whose wave operations are only the
+    // allocation idiom (`lower::wave_local`) runs exactly as plain 32-lane
+    // host waves, each on its own: no exchange between the two halves
+    // through group memory, no barriers for it. Tried first (from
+    // xzevistx/VIctory g6-dlss; `VICTORY_WAVE_NATIVE=0`: only as a retry, below).
+    if native.stage == HwStage::Cs
+        && native.wave64
+        && lower::host_max_wave() == 32
+        && std::env::var_os("VICTORY_WAVE_NATIVE").is_none_or(|v| v != "0")
+        && lower::wave_local(p, st).is_ok()
+    {
+        let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
+        if let Ok((shader, wave)) = local
+            && wave != Some(64)
+        {
+            if std::env::var_os("VICTORY_WAVE_LOG").is_some() {
+                eprintln!("WAVE-NATIVE local 32-lane waves (allocation idiom)");
+            }
+            return Ok(shader);
+        }
+        lower::take_needs();
+    }
     let original = emit_program(c, native, p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
@@ -782,6 +804,23 @@ pub fn emit(
                 }
             }
         }
+        // `VICTORY_WAVE_WIDE_LAST=1`, last of all with `VICTORY_WAVE_WIDE` not set: the
+        // wave-wide branches ([`widen`]) for a program still stuck, which a 32-lane host
+        // would refuse (26 such programs on cool_fox's NVIDIA card, among them lighting
+        // the ambient stand-in covered for). Programs that translate otherwise never get
+        // here and keep their forms. From cool_fox's 2026-11-27 patch, where it is on by
+        // default; opt-in here so build 879C's translations stay as they are.
+        let wide_last = std::env::var_os("VICTORY_WAVE_WIDE_LAST").is_some_and(|v| v == "1");
+        if !wide_on && !driver_loop && wide_last {
+            let bases = [forms[1].1.as_ref().map(|f| &f.0), forms[0].1.as_ref().map(|f| &f.0), Some(p)];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why, false);
+                report("wave-wide branches (last resort)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
@@ -931,6 +970,29 @@ fn widen(
 }
 
 /// The translated program, and the wave size it requires of the host.
+/// The title's tiled-lighting SRVs it reads as unsigned integers (light
+/// lists and masks), by container digest: (root slot, table dword, view
+/// kind). Read as floats they turn into denormals, so no lamp reaches a tile.
+/// From DexNom/VIctory, by way of xzevistx/VIctory g6-dlss.
+pub(crate) fn tiled_lighting_uint_srvs(digest: [u8; 16]) -> &'static [(u8, u32, u32)] {
+    const DIRECTIONAL_EYE: &[(u8, u32, u32)] =
+        &[(0, 32, 10), (0, 968, 2), (0, 1160, 2), (1, 72, 2), (1, 80, 4)];
+    // (`VICTORY_UINT_LIGHTS=0`: all read as floats again, for comparison)
+    if std::env::var_os("VICTORY_UINT_LIGHTS").is_some_and(|v| v == "0") {
+        return &[];
+    }
+    match u128::from_be_bytes(digest) {
+        0x8386ec5b_47a3b2de_49309239_7987b35d => &[(1, 48, 2), (1, 56, 2)],
+        0x46545633_f601b707_19765403_267442c5
+        | 0xa3c6e3b5_a1226f1b_3b08afe2_ac7b6c3d
+        | 0x58795ccc_1d3237cf_683a8a7a_a88391fd => DIRECTIONAL_EYE,
+        0x56d5f614_619f530c_f1cf2b90_43b580e8
+        | 0xbd4ac3d8_98dc88e0_c0d0f252_2fbe6341
+        | 0x50d20881_47c267aa_c6ec8d21_9970b21b => &DIRECTIONAL_EYE[1..],
+        _ => &[],
+    }
+}
+
 fn emit_program(
     c: &Container,
     native: &NativeProgram,
@@ -1002,6 +1064,7 @@ fn emit_program(
         }
         _ => 0,
     };
+    lower::set_uint_srvs(tiled_lighting_uint_srvs(c.digest));
     let l = lower::lower(&lower::Parts {
         native,
         p,

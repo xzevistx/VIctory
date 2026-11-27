@@ -210,7 +210,7 @@ impl Blob {
     /// The library file in `dir`: a library a save left beside it
     /// ([`NEXT_FILE`]) takes its place first.
     fn of(dir: &std::path::Path) -> Blob {
-        let path = dir.join(LIBRARY_FILE);
+        let path = dir.join(library_file(LIBRARY_FILE));
         let next = dir.join(NEXT_FILE);
         if next.exists() && std::fs::rename(&next, &path).is_err() {
             tracing::warn!("the host pipeline library saved last could not take the old one's place");
@@ -440,6 +440,21 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
+
+/// `name` for the D3D12 runtime in use: as it is for the system's, with
+/// the SDK version for an Agility runtime (`host-pipelines-sdk722.bin`). A
+/// runtime refuses a library another made, and the run that refused it
+/// then wrote its own over it: 933 MB of pipelines were lost so on
+/// 2026-11-27.
+fn library_file(name: &str) -> String {
+    match crate::host::agility_sdk() {
+        Some(v) => match name.rsplit_once('.') {
+            Some((stem, ext)) => format!("{stem}-sdk{v}.{ext}"),
+            None => format!("{name}-sdk{v}"),
+        },
+        None => name.to_owned(),
+    }
+}
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 100_000;
 
@@ -628,7 +643,7 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+    let tmp = dir.join(library_file(LIBRARY_FILE)).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
@@ -723,7 +738,7 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// stay: the rest read as zeros). Where a system refuses, the new library
 /// is left beside it as [`NEXT_FILE`] for the next start.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    std::fs::rename(tmp, dir.join(library_file(LIBRARY_FILE))).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over

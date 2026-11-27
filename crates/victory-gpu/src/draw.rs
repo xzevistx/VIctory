@@ -539,14 +539,14 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     host_heaps_set: bool,
-    /// Tables made afresh in this list: (table, slot count, contents) → first
+    /// Tables made afresh in this list: (table, slot count, contents) â†’ first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// Title heap address, host heap identity, first slot, and slot count.
     /// Given back when the list has run, is reset or released.
     dynamic: Vec<(usize, u64, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
-    /// address; 0 for none) → dynamic slot, and the host copy the slot
+    /// address; 0 for none) â†’ dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
@@ -1621,7 +1621,7 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return prepare_failed!(self, SkippedPipeline);
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, self.topology == RECTANGLES) else {
             return prepare_failed!(self, MissingHostPipeline);
         };
         if p.compute || p.mesh != mesh {
@@ -3282,7 +3282,7 @@ impl State {
             }
             return;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, self.topology == RECTANGLES) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
@@ -3539,7 +3539,7 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, self.topology == RECTANGLES) else {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
@@ -3623,7 +3623,7 @@ impl State {
         const GLOBAL: u32 = 688;
         const DRAW_CONSTANTS: u32 = 56;
         let wanted = list_slots();
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, self.topology == RECTANGLES) else {
             return String::new();
         };
         let Some(stage) = p.stages.iter().find(|s| wanted.iter().any(|w| s.shader.hash.starts_with(w.as_str())))
@@ -3798,7 +3798,7 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
                     #[cfg(feature = "diagnostics")]
-                    if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
+                    if let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, self.topology == RECTANGLES) {
                         list.ran_indirect(p.pso.as_raw() as usize, &p.name, crate::host::indirects::DIRECT, x, &self.user);
                     }
                     // (The host takes 65,535 groups in a dimension: more is
@@ -3810,7 +3810,7 @@ impl State {
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
                     self.drew(
                         list,
-                        crate::pipeline::host_pipeline(self.pipeline as This),
+                        crate::pipeline::host_pipeline_for(self.pipeline as This, self.topology == RECTANGLES),
                         #[cfg(feature = "diagnostics")]
                         "DispatchMesh",
                     );
@@ -4256,7 +4256,7 @@ impl State {
     /// builds).
     #[cfg(feature = "diagnostics")]
     fn reads(&self, compute: bool) -> Vec<String> {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, self.topology == RECTANGLES) else {
             return vec!["no host pipeline".into()];
         };
         let mut out = Vec::new();
@@ -4311,7 +4311,7 @@ impl State {
             };
             self.drew(
                 list,
-                crate::pipeline::host_pipeline(self.pipeline as This),
+                crate::pipeline::host_pipeline_for(self.pipeline as This, self.topology == RECTANGLES),
                 #[cfg(feature = "diagnostics")]
                 "DrawInstanced",
             );
@@ -4327,13 +4327,13 @@ impl State {
     /// Whether the bound pipeline completes rectangles itself, in the
     /// geometry stage rectangle pipelines get (`HostPipeline::rects`).
     fn completes_rects(&self) -> bool {
-        crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rects)
+        crate::pipeline::host_pipeline_for(self.pipeline as This, self.topology == RECTANGLES).is_some_and(|p| p.rects)
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
     fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, self.topology == RECTANGLES) else {
             return false;
         };
         let rects = u64::from(count / 3);
@@ -4421,7 +4421,7 @@ impl State {
             };
             self.drew(
                 list,
-                crate::pipeline::host_pipeline(self.pipeline as This),
+                crate::pipeline::host_pipeline_for(self.pipeline as This, self.topology == RECTANGLES),
                 #[cfg(feature = "diagnostics")]
                 "DrawIndexedInstanced",
             );
@@ -4554,7 +4554,7 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, self.topology == RECTANGLES) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
@@ -5227,6 +5227,15 @@ fn describe(view: Option<&View>) -> String {
         Some(View::Constant(address, size))
             if *size >= 16 && crate::texture::committed(*address as *const u8, 16) =>
         {
+            // `VICTORY_CBV_FULL=1` (a diagnostic): every value, up to 2 KiB.
+            static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let full = *FULL.get_or_init(|| std::env::var_os("VICTORY_CBV_FULL").is_some_and(|v| v == "1"));
+            let n = if full { (*size as usize).min(2048) / 4 } else { 4 };
+            if n > 4 && crate::texture::committed(*address as *const u8, n * 4) {
+                // SAFETY: `n * 4` committed bytes of title memory.
+                let v: Vec<f32> = (0..n).map(|i| unsafe { (*address as *const f32).add(i).read_unaligned() }).collect();
+                return format!("Constant({address:#x}, {size}) {v:?}");
+            }
             // SAFETY: 16 committed bytes of title memory.
             let v = unsafe { (*address as *const [f32; 4]).read_unaligned() };
             format!("Constant({address:#x}, {size}) {v:?}")

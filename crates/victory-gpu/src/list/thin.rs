@@ -477,6 +477,13 @@ plain! {
     WAIT_VALUE wait_value = super::wait_value, (address: u64, comparison: u32, reference: u64);
     WAIT_VALUE64 wait_value64 = super::wait_value64, (address: u64, comparison: u32, reference: u64);
     SYNC sync = super::sync, (flags: u32, control: u32, address: u64, size: u64);
+    STRUCTURES structures = super::structures_op, (boxed: u64);
+}
+
+/// [`super::structures`] written down in the stream of list `this` (`boxed`:
+/// the builds, taken when the stream is carried out).
+pub(crate) fn record_structures(this: This, boxed: u64) {
+    structures(this, boxed);
 }
 
 const fn after(n: u64) -> u64 {
@@ -553,13 +560,16 @@ extern "system" fn list_reset_x(this: This, allocator: This, pipeline: This, _fl
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
     let align = usize::try_from(alignment).unwrap_or(0).max(16);
     let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
+        tracing::warn!(size, alignment, "upload memory asked of a size too large: none given");
         return std::ptr::null_mut();
     };
     if this.is_null() || !align.is_power_of_two() {
+        tracing::warn!(size, alignment, "upload memory asked with no list or an alignment that is no power of two: none given");
         return std::ptr::null_mut();
     }
     let front = front(this);
     if front.closed || front.recording.is_none() {
+        tracing::warn!(size, alignment, closed = front.closed, recording = front.recording.is_some(), "upload memory asked of a list that is not recording: none given");
         return std::ptr::null_mut();
     }
     let Some(mut block) = Upload::new(len) else {

@@ -124,9 +124,12 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
             "VICTORY_NAN_GUARD",
+            "VICTORY_WAVE_WIDE_LAST",
             "VICTORY_THREAD_TICKET",
             "VICTORY_WAVE_LDS_LOOSE",
             "VICTORY_SCC_LOCAL_ANY",
+            "VICTORY_UINT_LIGHTS",
+            "VICTORY_WAVE_NATIVE",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -183,6 +186,22 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate, refresh_in_runs()),
+        None => translate(container),
+    }
+}
+
+/// [`host_shader`] with float exports held at ±65504
+/// ([`victory_shader::emit::with_export_clamp`]), cached apart from it.
+pub(crate) fn host_shader_clamped(container: &[u8]) -> Result<HostShader, String> {
+    let translate =
+        |c: &[u8]| victory_shader::emit::with_export_clamp(|| victory_shader::emit::translate(c)).map_err(|e| e.to_string());
+    match CACHE.get() {
+        Some(cache) => {
+            let mut hash = blake3::Hasher::new();
+            hash.update(&build());
+            hash.update(b"exports clamped at 65504");
+            cached(cache, hash.finalize().as_bytes(), container, translate, refresh_in_runs())
+        }
         None => translate(container),
     }
 }

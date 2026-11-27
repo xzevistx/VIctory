@@ -2762,6 +2762,20 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
     (noted, before)
 }
 
+/// Clears the kernel's dirty bits of the 4 KiB pages of `[start, end)` of
+/// write-watched title memory: what landing just put there was ours, not the
+/// title's (`crate::land`, `VICTORY_LAND_WATCHED`). The caller asked those
+/// pages ([`writes`]) before it wrote, and looks at them after this: a write
+/// of the title's in between shows as bytes that are not the copy's, and one
+/// after it sets the bit again. Whether the kernel did it.
+pub(crate) fn reset_written(start: usize, end: usize) -> bool {
+    use windows_sys::Win32::System::Memory::ResetWriteWatch;
+    let (from, to) = (start & !(KERNEL_PAGE - 1), end.next_multiple_of(KERNEL_PAGE));
+    // SAFETY: a range of title memory that is write-watched (asked just
+    // before); the call only clears its dirty bits.
+    to > from && unsafe { ResetWriteWatch(from as *const _, to - from) } == 0
+}
+
 /// Whether every write of the title's to 64 KiB block `block` so far is in
 /// the journal ([`PUBLISHED`]).
 pub(crate) fn block_published(block: usize) -> bool {
@@ -3869,6 +3883,57 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'s
     g
 }
 
+/// The runtime's lazy GPU page-mapping copies (`VICTORY_LAZY_ALIAS=1`,
+/// after the user's vitory-xbox, improved): the mapper, which maps those of
+/// `[at, at + len)` not mapped yet (whether it mapped any), and the source,
+/// the address of a view that shows the same page as the lazy page holding
+/// `at` (at the same offset), so that a read or write of it needs no view of
+/// its own.
+static LAZY: std::sync::OnceLock<(fn(usize, usize) -> bool, fn(usize) -> Option<usize>)> = std::sync::OnceLock::new();
+
+/// Registers the runtime's lazy page-mapping copies ([`LAZY`]).
+pub fn use_lazy_mapper(mapper: fn(usize, usize) -> bool, source: fn(usize) -> Option<usize>) {
+    let _ = LAZY.set((mapper, source));
+}
+
+/// A page of `[at, at + len)` was not there: maps it if it is a lazy page
+/// of a GPU page-mapping copy; whether one was mapped (then try again).
+pub(crate) fn map_lazy(at: usize, len: usize) -> bool {
+    LAZY.get().is_some_and(|(mapper, _)| mapper(at, len))
+}
+
+/// Where the bytes at `at` can be read or written instead, if `at` lies in a
+/// lazy page not mapped: a view of the same physical page ([`LAZY`]).
+pub(crate) fn lazy_source(at: usize) -> Option<usize> {
+    LAZY.get().and_then(|(_, source)| source(at))
+}
+
+/// Whether lazy page-mapping copies are in use at all.
+pub(crate) fn lazy_on() -> bool {
+    LAZY.get().is_some()
+}
+
+/// Lazy pages met by our reads and writes: reads through another view,
+/// pages mapped because no view showed them, writes through another view.
+static LAZY_MET: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Counts one of [`LAZY_MET`], and says the totals at every power of two of
+/// all of them from 1024 on.
+pub(crate) fn lazy_counted(what: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    LAZY_MET[what].fetch_add(1, Relaxed);
+    let all: u64 = LAZY_MET.iter().map(|n| n.load(Relaxed)).sum();
+    if all >= 1024 && all.is_power_of_two() {
+        tracing::info!(
+            "lazy GPU page-mapping copies (VICTORY_LAZY_ALIAS=1), since the start: {} reads through another view of the page, \
+             {} pages mapped as no view showed them, {} writes through another view",
+            LAZY_MET[0].load(Relaxed),
+            LAZY_MET[1].load(Relaxed),
+            LAZY_MET[2].load(Relaxed)
+        );
+    }
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 pub(crate) fn install() {
@@ -3880,11 +3945,24 @@ pub(crate) fn install() {
         EXCEPTION_POINTERS,
     };
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // (The span this thread was in, before the handler's own.)
+        #[cfg(feature = "diagnostics")]
+        // (cool_fox reads the thread's current timeline span here; this tree's timeline has none.)
+        let outer: &'static str = "";
         let _fault = crate::timeline::span("a fault looked at");
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         const READ: usize = 0;
         const WRITE: usize = 1;
+        // Diagnostics (`VICTORY_LANDED_WATCH`): a landed page watched for its
+        // first touch, restored here; the access goes on.
+        #[cfg(feature = "diagnostics")]
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2
+            && crate::landwatch::fault(r.ExceptionInformation[1], r.ExceptionAddress as usize, outer)
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         // A fault of our own copies (`crate::safecopy`): whatever it is, if
         // it is not a block we guard, the copy fails and goes on from there.
         let ours = crate::safecopy::failing_exit(r.ExceptionAddress as usize);
@@ -3912,6 +3990,15 @@ pub(crate) fn install() {
                     && r.NumberParameters >= 2
                     && r.ExceptionInformation[0] == READ
                     && came_back(r.ExceptionInformation[1], false) =>
+                {
+                    EXCEPTION_CONTINUE_EXECUTION
+                }
+                // A read of a lazy page of a GPU page-mapping copy, not
+                // through our copies (`VICTORY_LAZY_ALIAS`): mapped now.
+                None if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+                    && r.NumberParameters >= 2
+                    && lazy_on()
+                    && map_lazy(r.ExceptionInformation[1], 1) =>
                 {
                     EXCEPTION_CONTINUE_EXECUTION
                 }
@@ -3964,6 +4051,8 @@ pub(crate) fn install() {
         match ours {
             Some(exit) => fail(exit),
             None if came_back(at, true) => EXCEPTION_CONTINUE_EXECUTION,
+            // As for reads: a lazy page, mapped now.
+            None if lazy_on() && map_lazy(at, 1) => EXCEPTION_CONTINUE_EXECUTION,
             None => EXCEPTION_CONTINUE_SEARCH,
         }
     }

@@ -973,6 +973,19 @@ extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char
 
 extern "system" fn submit_async(_: This, update: *const Update, block: *mut AsyncBlock) -> HRESULT {
     let hr = get(update).map_or(E_INVALIDARG, Update::submit);
+    // Every save G6 makes, and why one is refused (g6-vt2: a run stopped
+    // on the game's "Couldn't autosave" with nothing in the log).
+    if let Some(u) = get(update) {
+        let bytes: usize = u.changes.iter().map(|(_, d)| d.as_ref().map_or(0, Vec::len)).sum();
+        let blobs = u.changes.len();
+        if hr == S_OK {
+            tracing::info!(container = %u.name, blobs, bytes, "game save written");
+        } else {
+            tracing::warn!(container = %u.name, blobs, bytes, hr = format_args!("{:#010x}", hr as u32), "game save refused");
+        }
+    } else {
+        tracing::warn!("game save submitted with no update");
+    }
     xasync::finished(block, (&raw const SUBMIT).cast(), hr)
 }
 extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {

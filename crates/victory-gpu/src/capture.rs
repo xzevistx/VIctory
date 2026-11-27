@@ -142,22 +142,61 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     }
 }
 
+/// The last frame F8 asked for ([`f8_asked`]): [`save`] names it
+/// `frame-<n>-f8.png`, apart from the frames saved on a schedule.
+static F8_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// F8 while the game's window has focus: held, it saves one PNG per
+/// present; a tap between two presents (the key went down since the last
+/// look: frames are 100 ms apart, a tap is shorter) saves the next one.
+fn f8_asked() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F8};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+
+    // SAFETY: these calls query the current key and foreground-window state.
+    let state = unsafe { GetAsyncKeyState(i32::from(VK_F8)) };
+    if state >= 0 && state & 1 == 0 {
+        return false;
+    }
+    let mut owner = 0;
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut owner) };
+    owner == std::process::id()
+}
+
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
+    if folder().is_none() {
+        return false;
+    }
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let every = *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_CAPTURE_WORLD_EVERY").ok()
+            .and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(8)
+    });
     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
     // (small pictures of menus, loading screens and title cards).
     let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
-    // In the world: every 8th frame's picture, a timeline of the opening
+    // In the world: every requested interval (eight by default), a timeline of the opening
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(every);
+    // Looked at every frame, so that a tap is taken once.
+    let f8 = f8_asked();
+    if f8 {
+        F8_FRAME.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+    f8 || n.is_power_of_two() || listed(n) || before_world || in_world
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
 pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+    if F8_FRAME.load(std::sync::atomic::Ordering::Relaxed) == n {
+        tracing::info!(frame = n, "F8 picture saved");
+        save_as(&format!("frame-{n}-f8"), width, height, pitch, bgra, rows);
+    } else {
+        save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+    }
 }
 
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
@@ -358,7 +397,12 @@ static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::Hos
 
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
+    *ON.get_or_init(|| folder().is_some() && (crate::switch::on("VICTORY_DUMP_TARGETS") || grading_luts()))
+}
+
+fn grading_luts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_DUMP_GRADING_LUTS"))
 }
 
 /// Notes a title texture the frame being built renders to or writes.
@@ -383,7 +427,12 @@ pub(crate) fn dump_targets(frame: u64) {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        if grading_luts() {
+            if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || d.Format != DXGI_FORMAT_R16G16B16A16_FLOAT
+                || (d.Width, d.Height, d.DepthOrArraySize) != (33, 33, 33) {
+                continue;
+            }
+        } else if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
@@ -441,6 +490,22 @@ fn dump_one(
             return;
         }
         let pitch = f.RowPitch as usize;
+        if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+            // One 33-cube of uncompressed RGBA16F. Copy only populated texels,
+            // including on the final row where trailing pitch padding may be absent.
+            let width = f.Width as usize * 8;
+            let row_count = f.Height as usize * f.Depth as usize;
+            let mut texels = Vec::with_capacity(row_count * width);
+            for row in 0..row_count {
+                texels.extend_from_slice(std::slice::from_raw_parts(data.cast::<u8>().add(row * pitch), width));
+            }
+            buffer.Unmap(0, None);
+            let path = folder().unwrap().join(format!("frame-{frame}-{i:02}-{resource:?}-33x33x33.rgba16f"));
+            if let Err(error) = std::fs::write(path, texels) {
+                tracing::warn!(%error, frame, "grading lookup table could not be saved");
+            }
+            return;
+        }
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
         // A 24-bit depth plane comes back as 32-bit words: which depth values
         // (low 24 bits) and which top bytes it holds, the most common first.
@@ -654,7 +719,11 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     // lamp on black have the same highest value.
     let above = values.iter().filter(|v| v.iter().any(|c| c.is_finite() && *c > low)).count();
     let nonzero_percent = above as f32 * 100.0 / values.len().max(1) as f32;
-    tracing::info!(format, low, high, nonzero_percent, "target values");
+    // Infinite or NaN texels (black lamp and sun centres): how many, and the
+    // first one's place.
+    let not_finite = values.iter().filter(|v| v.iter().any(|c| !c.is_finite())).count();
+    let first_not_finite = values.iter().position(|v| v.iter().any(|c| !c.is_finite())).map(|i| (i % w.max(1), i / w.max(1)));
+    tracing::info!(format, low, high, nonzero_percent, not_finite, ?first_not_finite, "target values");
     // Small float colour targets (the 1x1 luminance and exposure targets):
     // every texel's four channels as numbers. The picture has no alpha and
     // eight bits a channel.

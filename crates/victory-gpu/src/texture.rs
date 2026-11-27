@@ -364,8 +364,10 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 }
 
 /// Whether a texture refresh that finds the runtime remapping title memory
-/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`; off by
-/// default).
+/// goes on without waiting for it: on unless `VICTORY_TEXTURE_NO_WAIT=0`.
+/// On by default as in the user's vitory-xbox ("Fast texture reads"), whose
+/// 3 A/B pairs of 3-minute runs had 1.99 against 1.46 fps and texture
+/// refreshes of 19 against 150 ms a frame, 0 errors.
 ///
 /// A texture whose memory is all mapped is read in place, under a lock
 /// the runtime takes alone while it changes a mapping
@@ -389,7 +391,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// has recorded the upload from it by then.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Whether a refresh that does not wait ([`no_wait`]) and finds a page
@@ -1881,7 +1883,7 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
             // SAFETY: plain data the query filled in.
             let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
             let mut byte = [0u8];
-            if valid || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
+            if valid || crate::host::read_into_raw(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
                 there += 1;
             } else if all {
                 return (there, of);

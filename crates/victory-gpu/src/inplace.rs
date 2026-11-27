@@ -596,9 +596,7 @@ pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
         Some(w) => w.1,
         None => {
             let &(_, bytes, _) = v.sections.iter().find(|s| s.0 == section)?;
-            // SAFETY: the whole of a section the runtime made; a view the
-            // title sees is of it, so its handle is open.
-            let base = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, 0, 0, bytes as usize) }.Value as usize;
+            let base = high_view(section, bytes as usize);
             if base == 0 {
                 tracing::warn!(error = %std::io::Error::last_os_error(), "no view of the title's pages beside its own");
             }
@@ -607,6 +605,57 @@ pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
         }
     };
     (base != 0).then(|| base + offset as usize)
+}
+
+/// Whether whole-section views of our own go above the title's addresses
+/// ([`high_view`], and `xmem`'s section window): `VICTORY_HIGH_VIEWS=0`
+/// places them where Windows likes, as before (g6-vt2, for an A/B of the
+/// broken blocks seen in runs vt2-save-*).
+pub fn high_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HIGH_VIEWS").is_none_or(|v| v != "0"))
+}
+
+/// A view of the whole of `section`, in [2^41, 2^46) (g6-vt2): a plain view
+/// lands at the lowest free address, in [4 GiB, 2^37), which list uploads
+/// and title memory by address need (`crate::upload`); G6's 6.1 GiB section
+/// filled it and the game ended at a cutscene. Only the CPU reads it. 0 if
+/// none can be made.
+fn high_view(section: usize, bytes: usize) -> usize {
+    if !high_views() {
+        // SAFETY: as below.
+        return unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, 0, 0, bytes) }.Value as usize;
+    }
+    let mut requirements = mem::MEM_ADDRESS_REQUIREMENTS {
+        LowestStartingAddress: (1usize << 41) as *mut c_void,
+        HighestEndingAddress: ((1usize << 46) - 1) as *mut c_void,
+        Alignment: 0,
+    };
+    let mut parameter = mem::MEM_EXTENDED_PARAMETER::default();
+    parameter.Anonymous1._bitfield = mem::MemExtendedParameterAddressRequirements as u64;
+    parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+    // SAFETY: the whole of a section the runtime made; a view the title sees
+    // is of it, so its handle is open. The parameter points at
+    // `requirements`, which outlives the call.
+    let high = unsafe {
+        mem::MapViewOfFile3(
+            section as _,
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            std::ptr::null(),
+            0,
+            bytes,
+            0,
+            mem::PAGE_READWRITE,
+            &mut parameter,
+            1,
+        )
+    }
+    .Value as usize;
+    if high != 0 {
+        return high;
+    }
+    // SAFETY: as above.
+    unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, 0, 0, bytes) }.Value as usize
 }
 
 /// Our own address of the 64 KiB page the title sees at `page` ([`beside`]),

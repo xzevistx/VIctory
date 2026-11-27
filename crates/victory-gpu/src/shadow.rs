@@ -184,7 +184,13 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
     const TWELVE_GIB_MB: u64 = 12 * 1024;
     const TWENTY_GIB_MB: u64 = 20 * 1024;
     if budget_mb <= TWELVE_GIB_MB {
-        (16, 512)
+        // A seventh of the budget, at least the old 512 MiB: 512 MiB was
+        // full on an RTX 4070 (970 copies, 592 MB) and the copies past it
+        // stayed in the PC's memory, read over the bus and compared on the
+        // CPU (278 MB a frame); with 1536 the world went from 1-4 to 4-15
+        // fps (runs cfB, cfI, 2026-11-26). The room check (`card_room_for`)
+        // still stops copies at four fifths of the budget.
+        (16, (budget_mb / 7).max(512))
     } else if budget_mb < TWENTY_GIB_MB {
         (4, 2048)
     } else {
@@ -357,6 +363,65 @@ fn remaining_card_room(buffers: u64, used: u64, refused: u64, windows: u64, wind
         .saturating_add(windows.saturating_sub(window_used))
 }
 
+/// Whether copies of title buffers go to the card's memory even past its
+/// room line, the textures giving the room back afterwards
+/// (on by default since runs cfAN, cfAQ and cfAR: with 3,200 MB of the card
+/// held by another load, 4.0 → 10.1 fps and no copy turned down; without
+/// pressure it never acts. `VICTORY_CARD_BUFFERS_FIRST=0`: turned down as
+/// before).
+///
+/// A copy turned down for room stays in the PC's memory for as long as the
+/// title keeps the buffer: it is asked for once, and views made of it name
+/// its buffer, so it cannot be moved later. Its shaders read it over the bus
+/// and the CPU looks for their writes in it every frame. Turned down when the
+/// card was full of textures, or when the system's budget fell while a run
+/// went on: run cfAK, 666 MB turned down, 374 MB a frame looked through on
+/// the CPU, 2.5 fps. A texture let go is made and uploaded again when it is
+/// used; so textures give way to buffers.
+fn buffers_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS_FIRST").is_none_or(|v| v != "0"))
+}
+
+/// Bytes the card is over its room line for copies made past it
+/// ([`buffers_first`]): what the texture sweep is to let go
+/// (`crate::resource::let_go_idle`), at once and the longest idle first.
+static ROOM_WANTED: AtomicU64 = AtomicU64::new(0);
+
+/// With [`buffers_first`]: a copy that takes the card's use to `after`, past
+/// `line`, is made all the same and its excess wanted back; whether it is.
+fn buffers_first_over(after: u64, line: u64, size: u64) -> bool {
+    if !buffers_first() {
+        return false;
+    }
+    // Only what this copy adds over the line: the card may be past it for
+    // earlier copies already, whose share is wanted already (counted again,
+    // what was wanted grew to hundreds of GB in run cfAP).
+    let over = after.saturating_sub(line).min(size);
+    let wanted = ROOM_WANTED.fetch_add(over, Ordering::Relaxed) + over;
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    let n = SAID.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 16 || n.is_power_of_two() {
+        tracing::info!(
+            over_mb = over >> 20,
+            wanted_mb = wanted >> 20,
+            "a buffer's copy made in the card's memory past its room line; textures are to give the room back (VICTORY_CARD_BUFFERS_FIRST=1)"
+        );
+    }
+    true
+}
+
+/// Bytes of textures the sweep is to let go for copies made past the room
+/// line, and takes them as asked; 0 if none are wanted.
+pub(crate) fn room_wanted() -> u64 {
+    ROOM_WANTED.load(Ordering::Relaxed)
+}
+
+/// The sweep let `bytes` go of what [`room_wanted`] asked for.
+pub(crate) fn room_given(bytes: u64) {
+    let _ = ROOM_WANTED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |w| Some(w.saturating_sub(bytes)));
+}
+
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
@@ -448,6 +513,9 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     let hundredths = if card_room_kept_on() { 97 } else { 80 };
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 100 * hundredths
+        // Buffers first (`VICTORY_CARD_BUFFERS_FIRST=1`): made on the card
+        // all the same; the textures give the room back ([`room_wanted`]).
+        && !buffers_first_over(used + size, budget / 100 * hundredths, size)
     {
         // Said, with the numbers it was decided by: run 193 made 31 copies
         // of 95 and no line named the others. The first 64, then every
@@ -2145,7 +2213,77 @@ static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// (per frame). A copy of a title buffer can go to the card's memory,
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
 /// window outside buffers cannot as the code stands.
+/// `VICTORY_BACK_BY_COPY=1`: what shaders wrote that went back into title
+/// memory, summed per copy since the last frame-rate line: (title address,
+/// length, card copy, bytes, times). The ground for copies the title never
+/// reads (GPU-only buffers): which ones carry the copying back.
+static BACK_BY_COPY: Mutex<Option<std::collections::HashMap<u64, (u64, u64, bool, u64, u64)>>> = Mutex::new(None);
+
+fn back_by_copy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_BY_COPY").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_BACK_SKIP=<title address>,...` (an experiment): what shaders
+/// write into the copies starting at those addresses never goes back into
+/// title memory, as if the title never read them (GPU-only buffers). Wrong
+/// if the title does read them; for measuring what it would save.
+pub(crate) fn back_skipped(s: &Shadow) -> bool {
+    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_BACK_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok())
+            .collect()
+    });
+    !list.is_empty() && list.contains(&s.start)
+}
+
+pub(crate) fn note_back(s: &Shadow, bytes: usize, card: bool) {
+    if bytes == 0 || !back_by_copy() {
+        return;
+    }
+    let mut m = BACK_BY_COPY.lock().unwrap_or_else(|e| e.into_inner());
+    let e = m.get_or_insert_with(Default::default).entry(s.id).or_insert((s.start, s.len, card, 0, 0));
+    e.3 += bytes as u64;
+    e.4 += 1;
+}
+
+/// The copies that took most of the copying back since the last line.
+fn back_by_copy_line(frames: f64) {
+    if !back_by_copy() {
+        return;
+    }
+    let Some(m) = BACK_BY_COPY.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let total: u64 = m.values().map(|v| v.3).sum();
+    let mut v: Vec<_> = m.into_iter().collect();
+    v.sort_by_key(|(_, e)| std::cmp::Reverse(e.3));
+    let top: Vec<String> = v
+        .iter()
+        .take(16)
+        .map(|(id, (start, len, card, bytes, times))| {
+            format!(
+                "#{id} {start:#x}+{:.1}MB{} {:.2} MB/f in {:.1}",
+                *len as f64 / 1048576.0,
+                if *card { " card" } else { "" },
+                *bytes as f64 / 1048576.0 / frames,
+                *times as f64 / frames
+            )
+        })
+        .collect();
+    tracing::info!(
+        "copied back per frame by copy (VICTORY_BACK_BY_COPY): {:.1} MB in {} copies; most: {}",
+        total as f64 / 1048576.0 / frames,
+        v.len(),
+        top.join("; ")
+    );
+}
+
 pub(crate) fn back_line(frames: f64) {
+    back_by_copy_line(frames);
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if c.iter().all(|&v| v == 0.0) {
         return;
@@ -2664,6 +2802,17 @@ fn under_wide() -> bool {
 /// shortcut: a piece with very many runs has them joined over small gaps,
 /// where the old race is left.
 fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
+    let written = put_changed_now(at, title, merged);
+    // Diagnostics: does the title read what was put back?
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if written > 0 {
+        crate::landwatch::landed(at, written);
+    }
+    written
+}
+
+/// [`put_changed`] itself.
+fn put_changed_now(at: usize, title: &[u8], merged: &[u8]) -> usize {
     crate::watch::landing(at, title.len());
     if !exact_back() {
         crate::host::write_mapped(at as *mut u8, merged.as_ptr(), merged.len());
@@ -3762,6 +3911,15 @@ impl Shadow {
     /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
+        if back_skipped(self) {
+            return 0;
+        }
+        let n = self.copy_back_with_inner(address, len, found);
+        note_back(self, n, false);
+        n
+    }
+
+    fn copy_back_with_inner(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
         if self.place.is_some() {
             return 0;
         }
@@ -4978,6 +5136,15 @@ impl Shadow {
     /// sends it up before the next submission. `title` is scratch memory.
     /// Returns the bytes written to title memory.
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
+        if back_skipped(self) {
+            return 0;
+        }
+        let n = self.card_merge_inner(at, gpu, title);
+        note_back(self, n, true);
+        n
+    }
+
+    fn card_merge_inner(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         if self.card.is_none() || at + gpu.len() > self.len as usize {
             return 0;
@@ -5040,6 +5207,15 @@ impl Shadow {
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
     pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
+        if back_skipped(self) {
+            return 0;
+        }
+        let n = self.card_merge_relay_inner(at, gpu, fetched_after, title);
+        note_back(self, n, true);
+        n
+    }
+
+    fn card_merge_relay_inner(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         let Some(card) = &self.card else {
             return 0;
@@ -5259,6 +5435,27 @@ impl Shadow {
             return false;
         };
         let held = *at != 0 && *at >= before && crate::watch::block_published(block);
+        if held {
+            *at = (*at).max(now);
+        }
+        held
+    }
+
+    /// [`Shadow::landed`] for write-watched title memory landed through the
+    /// title's own address (`crate::land`, `VICTORY_LAND_WATCHED`): its pages
+    /// were asked before the landing and their dirty bits cleared after it,
+    /// and the caller found title memory and this copy alike there, so no
+    /// write of the title's was missed. The copy is up to date if it held
+    /// every write noted before (`before`); whether it was noted so.
+    pub(crate) fn landed_watched(&self, block: usize, before: u64, now: u64) -> bool {
+        let Some(page) = block.checked_sub(self.start as usize / PAGE) else {
+            return false;
+        };
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(at) = copied.get_mut(page) else {
+            return false;
+        };
+        let held = *at != 0 && *at >= before;
         if held {
             *at = (*at).max(now);
         }
@@ -6230,9 +6427,10 @@ mod window_tests {
 
         // Unknown (WARP / query failure) and <= 12 GiB keep the 12 GB baseline.
         assert_eq!(default_card_limits_mb(None), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(3 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 8 * 1024 / 7));
+        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 11 * 1024 / 7));
+        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 12 * 1024 / 7));
 
         // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
         assert_eq!(default_card_limits_mb(Some(13 * GIB)), (4, 2048));

@@ -43,7 +43,12 @@ pub(crate) fn on() -> bool {
         return on;
     }
     static ON: OnceLock<bool> = OnceLock::new();
+    // Not with lazy GPU page-mapping copies (`VICTORY_LAZY_ALIAS`, cool_fox): read ahead, a
+    // texture in lazy pages came out stale and spread over the surfaces that sample it (runs
+    // vt-smear-*: smeared with both on, clean with this off, 12.1 fps and a 1% low of 3.6).
+    // (Asked each time: lazy pages are only known once the title's mapper is registered.)
     *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_AHEAD").is_some_and(|v| v != "0"))
+        && !crate::watch::lazy_on()
 }
 
 /// An upload on its way.

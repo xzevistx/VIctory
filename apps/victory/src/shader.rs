@@ -219,3 +219,83 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
 }
+
+// Ported from the user's vitory-xbox (`VICTORY_PRECOMPILED=1`).
+/// A container's stage hash: the 16 bytes after the flags word of its
+/// `HASH` part (what the console's precompiled pipelines name a stage by).
+pub(crate) fn stage_hash(container: &[u8]) -> Option<[u8; 16]> {
+    let c = Container::parse(container).ok()?;
+    c.part(FourCC::HASH)?.data.get(4..20)?.try_into().ok()
+}
+
+/// The title's shader archive by stage hash ([`stage_hash`]): where each
+/// container's packed record lies, found once (about 3 s, on the thread
+/// that first asks, or ahead by [`ArchiveIndex::warm`]); containers are
+/// unpacked as asked. The archive stays as it is on disk.
+pub(crate) struct ArchiveIndex {
+    path: PathBuf,
+    index: std::sync::OnceLock<std::collections::HashMap<[u8; 16], usize>>,
+}
+
+impl ArchiveIndex {
+    pub(crate) fn new(path: PathBuf) -> std::sync::Arc<ArchiveIndex> {
+        std::sync::Arc::new(ArchiveIndex { path, index: std::sync::OnceLock::new() })
+    }
+
+    fn index(&self) -> &std::collections::HashMap<[u8; 16], usize> {
+        self.index.get_or_init(|| {
+            let started = std::time::Instant::now();
+            let mut map = std::collections::HashMap::new();
+            if let Ok(data) = std::fs::read(&self.path) {
+                for record in sgd5::records(&data) {
+                    if let Some(bytes) = record.unpack()
+                        && let Some(h) = stage_hash(&bytes)
+                    {
+                        map.entry(h).or_insert(record.offset);
+                    }
+                }
+            }
+            eprintln!(
+                "shader archive index: {} stage hashes in {:.1} s",
+                map.len(),
+                started.elapsed().as_secs_f32()
+            );
+            map
+        })
+    }
+
+    /// Builds the index on a thread of its own.
+    pub(crate) fn warm(self: &std::sync::Arc<Self>) {
+        let me = self.clone();
+        let _ = std::thread::Builder::new().name("victory-archive-index".into()).spawn(move || {
+            me.index();
+        });
+    }
+
+    /// The containers of `hashes`, unpacked from their records.
+    pub(crate) fn find(&self, hashes: &[[u8; 16]]) -> Vec<Option<Vec<u8>>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let index = self.index();
+        hashes
+            .iter()
+            .map(|h| {
+                let &at = index.get(h)?;
+                // The record's size precedes its marker; its name before that.
+                const BEFORE: usize = 512;
+                let from = at.saturating_sub(BEFORE);
+                let mut file = std::fs::File::open(&self.path).ok()?;
+                file.seek(SeekFrom::Start((at - 4) as u64)).ok()?;
+                let mut n = [0u8; 4];
+                file.read_exact(&mut n).ok()?;
+                let n = u32::from_le_bytes(n) as usize;
+                if n > 64 << 20 {
+                    return None;
+                }
+                let mut buf = vec![0u8; at + n - from];
+                file.seek(SeekFrom::Start(from as u64)).ok()?;
+                file.read_exact(&mut buf).ok()?;
+                sgd5::records(&buf).find(|r| r.offset == at - from)?.unpack()
+            })
+            .collect()
+    }
+}

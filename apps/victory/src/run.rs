@@ -244,6 +244,18 @@ pub fn run(
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
     let title_dir = exe.parent().unwrap_or(Path::new("."));
+    // The console's precompiled pipelines name their stages by hash: they
+    // are made from the title's own containers in its shader archive
+    // (`VICTORY_PRECOMPILED=1`; the index is built only then). Ported from the user's vitory-xbox (`VICTORY_PRECOMPILED=1`).
+    #[cfg(windows)]
+    {
+        let archive = title_dir.join("shaders.rpf");
+        if archive.is_file() && std::env::var_os("VICTORY_PRECOMPILED").is_some_and(|v| v == "1") {
+            let index = crate::shader::ArchiveIndex::new(archive);
+            index.warm();
+            victory_gpu::pipeline::set_container_finder(Box::new(move |hashes| index.find(hashes)));
+        }
+    }
     // A missing manifest leaves id 0 and no storage quota.
     let manifest =
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
@@ -325,6 +337,9 @@ pub fn run(
         inner: &resolver,
         dlls: &dlls,
     };
+    // The title's calls into its ray-tracing structure builder, wrapped where
+    // asked (`VICTORY_BVH_LOG=1`, `victory_hle::modules::bvh`).
+    let with_dlls = victory_hle::modules::bvh::Wraps(&with_dlls);
     let show = |name: &str, report: BindReport| {
         println!(
             "bound          {name}: {} hle, {} host, {} title, {} missing",

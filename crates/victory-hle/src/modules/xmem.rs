@@ -238,6 +238,15 @@ pub extern "system" fn XMemVirtualQuery(
         if VirtualQueryEx(process, address, out.cast(), size) == 0 {
             return 0;
         }
+        // A lazy page of a GPU page-mapping copy (`VICTORY_LAZY_ALIAS=1`)
+        // is memory the title mapped: mapped now, so that the answer says so
+        // (as a placeholder it reads as reserved, not graphics memory).
+        if (*out).host.State != MEM_COMMIT
+            && map_lazy(address as usize, 1)
+            && VirtualQueryEx(process, address, out.cast(), size) == 0
+        {
+            return 0;
+        }
         let info = &mut *out;
         info.flags = if info.host.State == MEM_COMMIT {
             GRAPHICS
@@ -433,6 +442,45 @@ impl Section {
             return None;
         }
         let base = *self.window.get_or_init(|| {
+            // Above the title's 40 bits (g6-vt2): a plain view lands at the
+            // lowest free address, in [4 GiB, 2^37), which list uploads and
+            // title memory by address need (`victory_gpu::upload`); G6's
+            // 6.1 GiB section left that range full at a cutscene's
+            // pre-streaming, and the game ended there. Only we write here.
+            let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+                LowestStartingAddress: (1usize << 41) as *mut c_void,
+                // Below the highest user address (2^47 less 64 KiB), or the
+                // requirement is refused.
+                HighestEndingAddress: ((1usize << 46) - 1) as *mut c_void,
+                Alignment: 0,
+            };
+            let mut parameter = MEM_EXTENDED_PARAMETER::default();
+            parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+            parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+            // (`VICTORY_HIGH_VIEWS=0`: placed low, as before.)
+            if victory_gpu::high_views() {
+                // SAFETY: the whole of a section we own; the parameter points
+                // at `requirements`, which outlives the call.
+                let high = unsafe {
+                    MapViewOfFile3(
+                        self.handle,
+                        GetCurrentProcess(),
+                        std::ptr::null(),
+                        0,
+                        self.pages * PAGE,
+                        0,
+                        PAGE_READWRITE,
+                        &mut parameter,
+                        1,
+                    )
+                }
+                .Value as usize;
+                if high != 0 {
+                    tracing::info!(at = format_args!("{high:#x}"), bytes = self.pages * PAGE, "a section's write window, above the title's addresses");
+                    return high;
+                }
+                tracing::warn!(error = %std::io::Error::last_os_error(), bytes = self.pages * PAGE, "a section's write window placed low");
+            }
             // SAFETY: the whole of a section we own.
             unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.pages * PAGE) }.Value as usize
         });
@@ -1311,12 +1359,16 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, to, len);
+    // (Nothing to note of a copy of no bytes, as below.)
+    if from != 0 && len > 0 && lazy_alias() {
+        return map_alias_lazy(&physical, to, from, len);
+    }
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
             break;
         }
         let at = from + k;
-        let Some(slice) = physical.slice_at(at) else {
+        let Some(slice) = source_slice(&physical, at) else {
             return false;
         };
         if !map(&mut physical, to + k, PAGE, slice) {
@@ -1328,9 +1380,20 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 
 /// [`map_alias`] of many ranges, in order.
 pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
+    // For the in-game panel's page-mapping line: pages and time.
+    let started = std::time::Instant::now();
+    let pages: u64 = ranges.iter().map(|r| r.2 / PAGE as u64).sum();
+    let ok = map_aliases_counted(ranges);
+    victory_gpu::panel_note(victory_gpu::PanelNote::PageCopies, pages);
+    victory_gpu::panel_note(victory_gpu::PanelNote::PageCopyUs, started.elapsed().as_micros() as u64);
+    ok
+}
+
+fn map_aliases_counted(ranges: &[(u64, u64, u64)]) -> bool {
     let _costed = Costed::begin(None);
     lift_thread();
-    if side_by_side() <= 1 {
+    // Lazy copies make no views: one by one, without the side-by-side pool.
+    if side_by_side() <= 1 || lazy_alias() {
         return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
     }
     // By the page: the address, and the one whose page it is to show.
@@ -1366,6 +1429,202 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
         ok &= change(&mut physical, ops);
     }
     ok
+}
+
+/// Whether the GPU's page-mapping copies ([`map_alias`]) are kept in
+/// [`LAZY`] instead of mapped by Windows (`VICTORY_LAZY_ALIAS=1`). After the
+/// user's vitory-xbox, where the title's own code never touched those
+/// addresses (109,955 pages watched, run aliasWatch) but it gained nothing,
+/// as our reads mapped nearly every page anyway. Here a read or write of a
+/// lazy page goes through a view that shows the same physical page
+/// ([`lazy_source`], from [`SHOWN`]), so that the page is mapped only where
+/// none does ([`map_lazy`]). Each map and unmap costs 200-300 us in the world
+/// and waits behind the title's own for the address-space lock (run cfW:
+/// 935 copies a second, 716 ms). On by default since runs cfX2 and cfX3
+/// (world fps median 12.1 and 11.2 against 8.4, copies 716 ms a second to
+/// 17, the title's own mapping 866 to 372, no errors; the picture right);
+/// `VICTORY_LAZY_ALIAS=0`: each copy is mapped, as before.
+pub(crate) fn lazy_alias() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_LAZY_ALIAS").is_none_or(|v| v != "0"));
+    *ON
+}
+
+/// A page of a GPU page-mapping copy: the page it shows, and whether
+/// Windows maps it yet ([`map_lazy`]).
+struct LazyPage {
+    slice: Slice,
+    mapped: bool,
+}
+
+/// The pages of GPU page-mapping copies by address ([`lazy_alias`]). A leaf
+/// lock: nothing else is asked for while it is held, but the system calls of
+/// [`map_lazy`]; never held while [`SHOWN`] is.
+static LAZY: Mutex<BTreeMap<usize, LazyPage>> = Mutex::new(BTreeMap::new());
+
+/// Whether [`LAZY`] was ever used (until then nobody takes its lock).
+static ANY_LAZY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Lazy pages noted, mapped when used, and let go never mapped.
+static LAZY_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+fn lazy() -> MutexGuard<'static, BTreeMap<usize, LazyPage>> {
+    LAZY.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lazy_stat(what: usize, n: u64) {
+    let noted = LAZY_STATS[what].fetch_add(n, Ordering::Relaxed);
+    if what == 0 && (noted + n) >> 16 != noted >> 16 {
+        tracing::info!(
+            noted = LAZY_STATS[0].load(Ordering::Relaxed),
+            mapped_when_used = LAZY_STATS[1].load(Ordering::Relaxed),
+            let_go_never_mapped = LAZY_STATS[2].load(Ordering::Relaxed),
+            "lazy GPU page-mapping copies (VICTORY_LAZY_ALIAS=1), pages since the start"
+        );
+    }
+}
+
+/// The page shown at `at`: by a view, or by a lazy page.
+fn source_slice(physical: &Physical, at: usize) -> Option<Slice> {
+    physical.slice_at(at).or_else(|| {
+        if !ANY_LAZY.load(Ordering::Relaxed) {
+            return None;
+        }
+        lazy().get(&(at & !(PAGE - 1))).map(|page| page.slice.clone())
+    })
+}
+
+/// [`map_alias`] with [`lazy_alias`]: the pages are noted, not mapped. What
+/// is told is as for a view ([`map`]): where the pages are seen ([`SHOWN`],
+/// so that DirectStorage's writes reach these addresses' copies too), the
+/// range changed, and which page each address shows.
+fn map_alias_lazy(physical: &Physical, to: usize, from: usize, len: usize) -> bool {
+    let mut slices = Vec::with_capacity(len / PAGE);
+    for k in (0..len).step_by(PAGE) {
+        let Some(slice) = source_slice(physical, from + k) else {
+            return false;
+        };
+        slices.push(slice);
+    }
+    {
+        let mut shown = shown_mut();
+        for (i, slice) in slices.iter().enumerate() {
+            shown.note(to + i * PAGE, PAGE, slice);
+        }
+    }
+    ANY_LAZY.store(true, Ordering::Relaxed);
+    {
+        let mut lazy = lazy();
+        for (i, slice) in slices.iter().enumerate() {
+            lazy.insert(to + i * PAGE, LazyPage { slice: slice.clone(), mapped: false });
+        }
+    }
+    victory_gpu::title_memory_remapped(to, len);
+    for (i, slice) in slices.iter().enumerate() {
+        victory_gpu::title_memory_view(to + i * PAGE, PAGE, slice.section.handle as usize, (slice.index * PAGE) as u64);
+    }
+    lazy_stat(0, slices.len() as u64);
+    true
+}
+
+/// Maps the lazy pages of `[at, at + len)` not mapped yet; whether it mapped
+/// any. Called where a read, write or fault found such a page and no view of
+/// its physical page could stand in for it ([`lazy_source`]).
+pub fn map_lazy(at: usize, len: usize) -> bool {
+    if len == 0 || !ANY_LAZY.load(Ordering::Relaxed) {
+        return false;
+    }
+    let mut mapped = 0u64;
+    let mut lazy = lazy();
+    for (&page, entry) in lazy.range_mut(at & !(PAGE - 1)..at.saturating_add(len)) {
+        // As `map`: the placeholder split around the page, the section's
+        // page mapped over it and committed. Nothing else maps `page` while
+        // its entry is here.
+        if entry.mapped {
+            continue;
+        }
+        if show(page, PAGE, &entry.slice, false) {
+            entry.mapped = true;
+            mapped += 1;
+        } else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(page = format_args!("{page:#x}"), "a lazy GPU page-mapping copy's page could not be mapped")
+            });
+        }
+    }
+    drop(lazy);
+    if mapped > 0 {
+        lazy_stat(1, mapped);
+    }
+    mapped > 0
+}
+
+/// Where `at`, in a lazy page not mapped, can be read or written instead:
+/// the same offset in a view that shows the same physical page. `None` if
+/// `at` is not such a page or nothing else shows it.
+pub fn lazy_source(at: usize) -> Option<usize> {
+    if !ANY_LAZY.load(Ordering::Relaxed) {
+        return None;
+    }
+    let page = at & !(PAGE - 1);
+    let slice = {
+        let lazy = lazy();
+        let entry = lazy.get(&page)?;
+        if entry.mapped {
+            return None;
+        }
+        entry.slice.clone()
+    };
+    // (Not with `LAZY` held.)
+    let seen = SHOWN.read().unwrap_or_else(|e| e.into_inner()).at(&slice);
+    let lazy = lazy();
+    seen.into_iter()
+        .map(|(view, _)| view)
+        .find(|&view| view != page && lazy.get(&view).is_none_or(|e| e.mapped))
+        .map(|view| view + (at - page))
+}
+
+/// The lazy pages of `[base, base + len)` go ([`unmap`]): those mapped are
+/// unmapped, and what showed them is told.
+fn lazy_drop(base: usize, len: usize) {
+    if !ANY_LAZY.load(Ordering::Relaxed) {
+        return;
+    }
+    let gone: Vec<(usize, LazyPage)> = {
+        let mut lazy = lazy();
+        let keys: Vec<usize> = lazy.range(base & !(PAGE - 1)..base.saturating_add(len)).map(|(&k, _)| k).collect();
+        keys.into_iter().filter_map(|k| lazy.remove(&k).map(|page| (k, page))).collect()
+    };
+    if gone.is_empty() {
+        return;
+    }
+    let mut never = 0;
+    for (at, page) in &gone {
+        if page.mapped {
+            // SAFETY: a view `map_lazy` mapped; a placeholder again.
+            counted(Call::Unmap, || unsafe {
+                UnmapViewOfFile2(
+                    GetCurrentProcess(),
+                    MEMORY_MAPPED_VIEW_ADDRESS { Value: *at as *mut c_void },
+                    MEM_PRESERVE_PLACEHOLDER,
+                )
+            });
+        } else {
+            never += 1;
+        }
+    }
+    {
+        let mut shown = shown_mut();
+        for (at, page) in &gone {
+            shown.forget(*at, PAGE, &page.slice);
+        }
+    }
+    for (at, _) in &gone {
+        victory_gpu::title_memory_unmapping(*at, PAGE);
+    }
+    if never > 0 {
+        lazy_stat(2, never);
+    }
 }
 
 /// Maps (page number not 0) or unmaps each address; false if a page is not
@@ -1862,6 +2121,8 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
     if len == 0 {
         return;
     }
+    // Lazy pages of GPU page-mapping copies there go too.
+    lazy_drop(base, len);
     let end = base + len;
     // Views do not overlap: the one holding `base`, then those starting
     // inside (the GPU's page mappings make one view per page).
@@ -2269,6 +2530,10 @@ mod tests {
         assert_eq!(query(at(a, 1)).host.State, MEM_RESERVE);
         // The GPU's page-mapping copy: what `a + 2 pages` shows, at `b`.
         assert!(map_alias(b as u64, at(a, 2) as u64, PAGE as u64));
+        // (A lazy copy, on by default, is mapped when used: here by hand.)
+        if lazy_alias() {
+            assert!(map_lazy(b as usize, PAGE));
+        }
         // SAFETY: mapped read-write.
         assert_eq!(unsafe { b.cast::<u8>().read() }, 7);
         assert!(map_alias(b as u64, 0, PAGE as u64));
@@ -2276,6 +2541,67 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    /// A lazy GPU page-mapping copy (`VICTORY_LAZY_ALIAS=1`) is not mapped
+    /// until `map_lazy`; until then `lazy_source` names the pool's view of
+    /// the same page (same offset), whose bytes are the copy's. Mapped, it
+    /// shows the pool page (reads and writes); a copy of a lazy copy shows
+    /// the same page; unmapping takes it away, mapped or not.
+    #[test]
+    fn lazy_page_mapping_copies_read_through_the_pool_and_map_when_used() {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        let state = |p: *mut c_void| {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+            info.State
+        };
+        let mut pages = [0usize; 2];
+        let mut n = 2;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let reserve =
+            || XMemVirtualAlloc(std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        let (a, b, c) = (reserve(), reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null() && !c.is_null());
+        let at = |p: *mut c_void, page: usize| p.wrapping_byte_add(page * PAGE);
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        // SAFETY: mapped read-write.
+        unsafe { at(a, 1).cast::<u8>().add(7).write(5) };
+        {
+            let physical = physical();
+            assert!(map_alias_lazy(&physical, b as usize, a as usize, 2 * PAGE));
+        }
+        assert_eq!(state(b), MEM_RESERVE, "not mapped until used");
+        // The pool's view stands in for the lazy page, at the same offset.
+        assert_eq!(lazy_source(at(b, 1) as usize + 7), Some(at(a, 1) as usize + 7));
+        assert_eq!(lazy_source(a as usize), None, "not a lazy page");
+        // A copy of a lazy copy shows the same page.
+        {
+            let physical = physical();
+            assert!(map_alias_lazy(&physical, c as usize, at(b, 1) as usize, PAGE));
+        }
+        assert_eq!(lazy_source(c as usize), Some(at(a, 1) as usize));
+        assert!(map_lazy(at(b, 1) as usize, 1));
+        assert!(!map_lazy(at(b, 1) as usize, 1), "mapped once");
+        assert_eq!(state(at(b, 1)), MEM_COMMIT);
+        assert_eq!(state(b), MEM_RESERVE, "only the page asked for");
+        assert_eq!(lazy_source(at(b, 1) as usize), None, "mapped: read in place");
+        // SAFETY: mapped read-write now.
+        unsafe {
+            assert_eq!(at(b, 1).cast::<u8>().add(7).read(), 5);
+            at(b, 1).cast::<u8>().add(7).write(6);
+            assert_eq!(at(a, 1).cast::<u8>().add(7).read(), 6);
+        }
+        // Unmapping: the lazy pages go, mapped or not.
+        assert!(map_alias(b as u64, 0, 2 * PAGE as u64));
+        assert!(map_alias(c as u64, 0, PAGE as u64));
+        assert_eq!(state(at(b, 1)), MEM_RESERVE);
+        assert_eq!(state(c), MEM_RESERVE);
+        assert!(!map_lazy(b as usize, 2 * PAGE), "nothing left to map");
+        assert_eq!(lazy_source(c as usize), None);
+        assert!(lazy().range(b as usize..b as usize + 2 * PAGE).next().is_none());
     }
 
     /// A thread that reads a mapped page in place, as the GPU side reads a
@@ -2410,6 +2736,11 @@ mod tests {
         let half = (N / 2 * PAGE) as u64;
         let (from, to) = (a as u64, at(N) as u64);
         assert!(map_aliases(&[(to, from, half), (to + half, to, half)]));
+        // Lazy copies (`VICTORY_LAZY_ALIAS`, on by default) are mapped when
+        // used: here by hand, as the fault handler does in a run.
+        if lazy_alias() {
+            assert!(map_lazy(to as usize, (2 * half) as usize));
+        }
         for k in 0..N / 2 {
             // SAFETY: mapped read-write.
             unsafe {
