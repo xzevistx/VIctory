@@ -129,9 +129,22 @@ pub(crate) fn describe() -> Option<String> {
     }
 }
 
+/// g6-vt2 defaults, used when the switch is not set at all (`0` turns each
+/// off). Without the title's rays G6 shows magenta probe memory ("purple
+/// glow"), sky light in shade and glowing air (whiteout at sunset), and
+/// stale traced reflections; the stand-in removed the magenta (magenta
+/// pixels 0.53% in run rt-a-off, 0.04% in rt-b-ambient, same scenes).
+/// (The black blocks on water came from the indirect switches instead,
+/// `scripts/g6/run-g6.ps1`.) `VICTORY_AMBIENT=0` gives the title's own
+/// output as upstream has it.
+const G6_AMBIENT: &str = "0.8";
+const G6_AIR: &str = "2";
+const G6_REFLECT: &str = "2";
+const G6_REFLECT_IN: &str = "CombinedReflections";
+
 fn set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
-    *SET.get_or_init(|| match parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()) {
+    *SET.get_or_init(|| match parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_else(|_| G6_AMBIENT.to_owned())) {
         // With the band asked for and no share, the band's level.
         Set::Off => rt_band().map_or(Set::Off, |b| Set::Estimate(b.level)),
         set => set,
@@ -190,7 +203,7 @@ fn bounds() -> (f32, f32) {
 fn air() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
+        let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_else(|_| G6_AIR.to_owned());
         set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
     })
 }
@@ -202,7 +215,7 @@ fn air() -> f32 {
 fn reflect() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| {
-        parse_reflect(&std::env::var("VICTORY_AMBIENT_REFLECT").unwrap_or_default())
+        parse_reflect(&std::env::var("VICTORY_AMBIENT_REFLECT").unwrap_or_else(|_| G6_REFLECT.to_owned()))
     })
 }
 
@@ -224,7 +237,7 @@ fn reflect_in() -> &'static [String] {
         if held == 0.0 {
             return Vec::new();
         }
-        let text = std::env::var("VICTORY_AMBIENT_REFLECT_IN").unwrap_or_default();
+        let text = std::env::var("VICTORY_AMBIENT_REFLECT_IN").unwrap_or_else(|_| G6_REFLECT_IN.to_owned());
         let names = parse_reflect_in(&text);
         if names.is_empty() {
             tracing::warn!(

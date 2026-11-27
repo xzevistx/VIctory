@@ -1729,10 +1729,18 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
         };
         if len <= 3 * WINDOW {
             take(0, len);
-        } else {
+        } else if len <= 16 * WINDOW {
             take(0, WINDOW);
             take((len / 2) & !0xfff, WINDOW);
             take(len - WINDOW, WINDOW);
+        } else {
+            // g6-vt2: eight looks spread over a large texture, not three: a
+            // change in the quarters between them went unseen (blocks of
+            // old skin on faces and arms). Same bytes read in all (48 KiB).
+            const PART: usize = 6 << 10;
+            for k in 0..8 {
+                take((k * (len - PART) / 7) & !0xfff, PART);
+            }
         }
     });
     let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();

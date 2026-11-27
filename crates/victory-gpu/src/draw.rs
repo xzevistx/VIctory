@@ -214,6 +214,13 @@ fn bake_exact() -> bool {
 /// Whether a texture found changed with nothing to tell of it is looked at
 /// again in the next frame (`VICTORY_RECHECK_SOON=0`: after four, as
 /// before).
+/// `VICTORY_HEAP_RECHECK_LONG=0`: a texture picked by index is not looked
+/// at again after the last of [`RECHECK_FRAMES`] (g6-vt2: on by default).
+fn recheck_long() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK_LONG").is_none_or(|v| v != "0"))
+}
+
 fn recheck_soon() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_SOON").is_none_or(|v| v != "0"))
@@ -2862,6 +2869,21 @@ impl State {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
                         }
+                        // g6-vt2: looked at for good, every last interval
+                        // (`VICTORY_HEAP_RECHECK_LONG=0`: done after the
+                        // last look, as before). G6 fills parts of large
+                        // textures (skin) long after their first upload;
+                        // the host copy kept blocks of the old contents on
+                        // faces and arms for the rest of the run.
+                        None if recheck_long() => host.texture_slot_recheck(
+                            index,
+                            write,
+                            frame + RECHECK_FRAMES[RECHECK_FRAMES.len() - 1],
+                            (at, len),
+                            print,
+                            looks,
+                            uploaded,
+                        ),
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;

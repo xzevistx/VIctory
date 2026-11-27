@@ -86,13 +86,25 @@ You need your own legal dump of the title. No game files are in this repository.
 - **DLSS ultra-performance** for every host-upscaler profile (`VICTORY_DLSS`, `VICTORY_DLSS_4K`, `VICTORY_FSR_4K` accept `ultra-performance`: a third of the output per axis; `apps/victory/src/fsr_4k.rs`).
 - **Room for the title's ray tracing** (experimental): with `VICTORY_BVH_BUILDER=1` 48 arenas of 64 MiB for memory by address are reserved at start instead of 4 (`VICTORY_MEMORY_ARENAS=<n>`, `upload.rs` `claim`). With 4 the builder ran out of room within seconds and the picture went black.
 
-## Ray tracing (why outdoor scenes glow white, and the dark blocks on water)
+## Picture fixes on by default (since g6-vt2 after 0c0eec4)
 
-G6 traces its own rays: its `XboxBvhBuilder.dll` builds the structures and compute shaders walk them (see `docs/fork-ray-tracing.md`). VIctory leaves the builder out by default, so every ray misses. Outdoors that leaves the sky's light where there should be shadow (whiteout, glow), indoors nothing, and on water blocks of stale tiles. Options today:
+Measured on the same scenes from one saved game, Series S + DLSS, rays off:
 
-- default: rays off (fastest; the artefacts above outdoors);
-- `VICTORY_AMBIENT=0.8` (+ `VICTORY_AMBIENT_AIR=2`): an estimate of the indirect light, about 2-3 FPS less; the water blocks remain;
-- `VICTORY_BVH_BUILDER=1`: the title's own ray tracing, being made to work (memory room, above; it ran at about 4 FPS before that change).
+| Fault | Cause | Fix (default) | Turn it off |
+|---|---|---|---|
+| Black blocks on water, a stray square in the sky, blocky mosaic textures (a shirt) | the Vice-Tay set's `VICTORY_INDIRECT_WINDOW=1` / `VICTORY_INDIRECT_BATCH=2`: G6's tiled passes read stale tile counts, so tiles stayed unshaded | `run-g6.ps1` no longer sets them (runs fix-t1 against fix-t2: blocks gone, 16.0 → 18.6 FPS) | set them again with `-Extra` |
+| Purple / magenta glow | with rays off, the screen probes' memory holds garbage that comes out magenta | the stand-in lighting is on unless `VICTORY_AMBIENT` is set: 0.8 of the estimate, air bounded at 2x, reflections held at 2x on `CombinedReflections` (`ambient.rs` `G6_*`); magenta pixels 0.53% → 0.04–0.2% | `VICTORY_AMBIENT=0` |
+| Old blocks of skin and clothes staying on characters | textures picked by index were checked 5 times (3 small samples) and then never again; G6 fills large textures later | checked every 400 frames for good, 8 samples spread over large textures (`draw.rs` `recheck_long`, `texture.rs` `fingerprint`) | `VICTORY_HEAP_RECHECK_LONG=0` |
+
+Still open: whiteout when the camera goes underwater and in the sunset rooftop chase (probe and air light with rays off); smooth untextured background characters in fast cuts (the title's lowest streaming levels shown because the full ones arrive late).
+
+## Ray tracing (why outdoor scenes glow white)
+
+G6 traces its own rays: its `XboxBvhBuilder.dll` builds the structures and compute shaders walk them (see `docs/fork-ray-tracing.md`). VIctory leaves the builder out by default, so every ray misses. Outdoors that leaves the sky's light where there should be shadow (whiteout, glow), indoors nothing, and magenta probe memory. (The black blocks on water were not this: see the table above.) Options today:
+
+- default: rays off with the stand-in (above);
+- `VICTORY_AMBIENT=0`: rays off, the title's own output (magenta, glow);
+- `VICTORY_BVH_BUILDER=1`: the title's own ray tracing. It works: a proper ray-traced picture at about 13 FPS once its ~1,000 shaders are compiled (two or three warm-up runs; black until then), against about 20 rays off.
 
 ## Known open problems (good places to help)
 
