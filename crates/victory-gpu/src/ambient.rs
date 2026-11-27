@@ -120,6 +120,15 @@ fn parse(set: &str) -> Set {
     }
 }
 
+/// The stand-in for the panel's RAYS line (g6-vt2), if it is on.
+pub(crate) fn describe() -> Option<String> {
+    match set() {
+        Set::Off => None,
+        Set::Estimate(share) => Some(format!("STAND-IN {share:.1}")),
+        Set::Constant(level) => Some(format!("STAND-IN CONSTANT {level:.1}")),
+    }
+}
+
 fn set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
     *SET.get_or_init(|| match parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()) {

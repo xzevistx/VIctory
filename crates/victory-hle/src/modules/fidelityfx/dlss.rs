@@ -1768,6 +1768,7 @@ fn evaluate(
             camera: std::array::from_fn(|index| f32::from_bits(dispatch.settings[5 + index])),
         });
     }
+    victory_gpu::panel_upscaled("DLSS", values.render, output_size);
     let frames = ctx.frames.fetch_add(1, Ordering::Relaxed) + 1;
     if frames == 1 {
         tracing::info!(

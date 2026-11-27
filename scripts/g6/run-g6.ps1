@@ -44,3 +44,4 @@ $env:VICTORY_CAPTURE = "$DataRoot\frames"
 $env:VICTORY_DISPLAY_MODE = $Display
 $env:VICTORY_LOG = 'info'
 & $Exe run "$GameDir\game_scarlett_master.exe" --console $Console --execute 2> "$DataRoot\events.txt"
+exit $LASTEXITCODE

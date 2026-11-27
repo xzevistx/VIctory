@@ -11,6 +11,10 @@ pub(super) enum FsrPreset {
     Quality,
     Balanced,
     Performance,
+    /// A third of the output on each axis (FidelityFX mode 4, NGX
+    /// UltraPerformance): 1280x720 for 4K. g6-vt2: G6's frames are
+    /// CPU-bound on per-frame copies that shrink with the render size.
+    UltraPerformance,
 }
 
 impl FsrPreset {
@@ -23,7 +27,7 @@ impl FsrPreset {
             Ok(name) => Self::from_name(&name.trim().to_ascii_lowercase())
                 .map(Some)
                 .with_context(|| {
-                    format!("{switch}={name}: expected quality, balanced, performance or 0")
+                    format!("{switch}={name}: expected quality, balanced, performance, ultra-performance or 0")
                 }),
             Err(error) => Err(error.into()),
         }
@@ -34,6 +38,7 @@ impl FsrPreset {
             "quality" => Some(Self::Quality),
             "balanced" => Some(Self::Balanced),
             "performance" => Some(Self::Performance),
+            "ultra-performance" | "ultra_performance" => Some(Self::UltraPerformance),
             _ => None,
         }
     }
@@ -43,6 +48,7 @@ impl FsrPreset {
             Self::Quality => "quality",
             Self::Balanced => "balanced",
             Self::Performance => "performance",
+            Self::UltraPerformance => "ultra-performance",
         }
     }
 
@@ -52,6 +58,7 @@ impl FsrPreset {
             Self::Quality => 1,
             Self::Balanced => 2,
             Self::Performance => 3,
+            Self::UltraPerformance => 4,
         }
     }
 
@@ -63,6 +70,7 @@ impl FsrPreset {
             Self::Quality => 2,
             Self::Balanced => 1,
             Self::Performance => 0,
+            Self::UltraPerformance => 3,
         }
     }
 
@@ -71,6 +79,7 @@ impl FsrPreset {
             Self::Quality => 2.0 / 3.0,
             Self::Balanced => 1.0 / 1.7,
             Self::Performance => 0.5,
+            Self::UltraPerformance => 1.0 / 3.0,
         }
     }
 
@@ -188,6 +197,7 @@ mod tests {
             ("quality", [2560, 1440], 2),
             ("balanced", [2258, 1270], 1),
             ("performance", [1920, 1080], 0),
+            ("ultra-performance", [1280, 720], 3),
         ] {
             let preset = FsrPreset::from_name(name).unwrap();
             assert_eq!(preset.name(), name);

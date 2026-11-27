@@ -128,7 +128,7 @@ mod texback;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
-pub use fpsbox::{Note as PanelNote, note as panel_note};
+pub use fpsbox::{Note as PanelNote, note as panel_note, set_upscaler as panel_upscaler, upscaled as panel_upscaled};
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).

@@ -10596,8 +10596,19 @@ impl Meter {
             // page-mapping copies.
             {
                 let secs = (frames * ms / 1000.0).max(0.001);
-                let [streamed, requests, page_copies, page_us] = crate::fpsbox::take_notes();
+                let [streamed, requests, page_copies, page_us, upscales, drop_rays, drop_skipped, drop_other, faults, faults_left, outside, no_room] =
+                    crate::fpsbox::take_notes();
                 let mut more = vec![
+                    // What of a frame is not ours: the title's own threads and
+                    // waits (the frame less CPU and GPU above).
+                    format!("GAME+WAIT {:.0} MS", (ms - cpu - gpu).max(0.0)),
+                    // Per frame (diagnostics builds count them).
+                    format!(
+                        "DROPS RAYS {:.0} SKIP {:.0} OTHER {:.0}",
+                        drop_rays as f64 / frames,
+                        drop_skipped as f64 / frames,
+                        drop_other as f64 / frames
+                    ),
                     format!("TEX UP {texture_mb:.1} MB {texture_ms:.0} MS"),
                     format!("COPY {copy_mb:.0} MB {copy_ms:.0} MS"),
                     format!("BACK {back_mb:.1} MB {back_ms:.0} MS"),
@@ -10607,6 +10618,34 @@ impl Meter {
                 }
                 more.push(format!("STREAM {:.0} MB/S {:.0}/S", streamed as f64 / 1e6 / secs, requests as f64 / secs));
                 more.push(format!("PAGEMAP {:.0}/S {:.0} MS", page_copies as f64 / secs, page_us as f64 / 1000.0 / secs));
+                more.extend(crate::fpsbox::upscaler_lines(upscales as f64 / secs));
+                // Ray tracing: the builder's state or the stand-in; with the
+                // builder, pages its walks found with no copy (reads gave 0).
+                let rays = match (crate::pipeline::builder_state(), crate::ambient::describe()) {
+                    ("OFF", Some(stand_in)) => format!("RAYS OFF {stand_in}"),
+                    ("OFF", None) => "RAYS OFF".to_owned(),
+                    (state, _) => format!("RAYS BUILDER {state}"),
+                };
+                more.push(rays);
+                if faults > 0 {
+                    more.push(format!("NO PAGE {:.0}/S LEFT {:.0}/S", faults as f64 / secs, faults_left as f64 / secs));
+                }
+                // Since the start: placed outside the slots, and with no room.
+                static PLACED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+                let outside = PLACED[0].fetch_add(outside, Ordering::Relaxed) + outside;
+                let no_room = PLACED[1].fetch_add(no_room, Ordering::Relaxed) + no_room;
+                let (free, all) = crate::upload::slots_free();
+                more.push(format!("UPLOAD SLOTS {free}/{all} OUT {outside} NO ROOM {no_room}"));
+                {
+                    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+                    // SAFETY: plain data the call fills in.
+                    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+                    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+                    // SAFETY: a sized structure.
+                    if unsafe { GlobalMemoryStatusEx(&mut m) } != 0 {
+                        more.push(format!("RAM FREE {} MB", m.ullAvailPhys >> 20));
+                    }
+                }
                 crate::fpsbox::set_more(more);
             }
             peek_title();

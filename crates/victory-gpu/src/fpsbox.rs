@@ -80,7 +80,7 @@ pub(crate) fn set_detail(cpu_ms: f64, gpu_ms: f64, dropped: f64, making: f64) {
 }
 
 /// What the runtime's other parts tell the panel ([`note`]), summed until
-/// the next second's lines take them (g6-vt2: Joshua asked for the panel to
+/// the next second's lines take them (g6-vt2: the branch owner asked for the panel to
 /// show texture loading and what the frames spend time on, in game).
 #[derive(Clone, Copy)]
 pub enum Note {
@@ -92,9 +92,26 @@ pub enum Note {
     PageCopies = 2,
     /// Microseconds spent making them.
     PageCopyUs = 3,
+    /// Frames a host upscaler (DLSS or FSR) recorded ([`upscaled`]).
+    Upscales = 4,
+    /// Draws and dispatches dropped because ray tracing is left out (the
+    /// structure builder off, hit shading or ray activation without it).
+    DropRays = 5,
+    /// Dropped because their pipeline is skipped on purpose (a list).
+    DropSkipped = 6,
+    /// Dropped while their pipeline is being made, or for any other reason.
+    DropOther = 7,
+    /// Pages of title memory by address shaders touched with no copy.
+    Faults = 8,
+    /// Of those, pages that stayed without one (the reads gave 0).
+    FaultsLeft = 9,
+    /// List uploads and memory by address placed outside the claimed slots.
+    UploadOutside = 10,
+    /// Of those, placements that found no room at all.
+    UploadNoRoom = 11,
 }
 
-static NOTES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+static NOTES: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
 
 /// Adds `n` to what the panel shows for `what`.
 pub fn note(what: Note, n: u64) {
@@ -102,8 +119,50 @@ pub fn note(what: Note, n: u64) {
 }
 
 /// The sums since the last take, from now on 0.
-pub(crate) fn take_notes() -> [u64; 4] {
+pub(crate) fn take_notes() -> [u64; 12] {
     NOTES.each_ref().map(|n| n.swap(0, Ordering::Relaxed))
+}
+
+/// The host upscaler chosen at start (`DLSS QUALITY`, `FSR 3.1.6`), empty
+/// while the title's own runs; and the one that recorded last, with its
+/// render and output sizes (g6-vt2: the branch owner asked for the panel to show
+/// that DLSS is on).
+static UPSCALER: Mutex<(String, &str, [u32; 4])> = Mutex::new((String::new(), "", [0; 4]));
+
+/// Names the host upscaler that serves the title.
+pub fn set_upscaler(name: String) {
+    UPSCALER.lock().unwrap_or_else(|e| e.into_inner()).0 = name;
+}
+
+/// `by` (`DLSS`, `FSR`) recorded a frame from `render` to `output` pixels.
+pub fn upscaled(by: &'static str, render: [u32; 2], output: [u32; 2]) {
+    let mut u = UPSCALER.lock().unwrap_or_else(|e| e.into_inner());
+    u.1 = by;
+    u.2 = [render[0], render[1], output[0], output[1]];
+    drop(u);
+    note(Note::Upscales, 1);
+}
+
+/// The panel's upscaler lines for `per_second` recorded frames: what was
+/// chosen and whether it ran, then the sizes it ran at.
+pub(crate) fn upscaler_lines(per_second: f64) -> Vec<String> {
+    let u = UPSCALER.lock().unwrap_or_else(|e| e.into_inner());
+    if u.0.is_empty() && u.1.is_empty() {
+        return vec!["UPSCALER TITLE OWN".to_owned()];
+    }
+    let chosen = if u.0.is_empty() { "HOST" } else { u.0.as_str() };
+    let state = match u.1 {
+        "" => "ON NOT RUN YET".to_owned(),
+        _ if per_second < 0.5 => "ON IDLE".to_owned(),
+        by if !chosen.starts_with(by) => format!("FELL BACK {by} {per_second:.0}/S"),
+        _ => format!("ON {per_second:.0}/S"),
+    };
+    let mut lines = vec![format!("{chosen} {state}")];
+    if !u.1.is_empty() {
+        let [rw, rh, ow, oh] = u.2;
+        lines.push(format!("{} {rw}X{rh} TO {ow}X{oh}", u.1));
+    }
+    lines
 }
 
 /// The second's lines beyond the first ones ([`set_more`]).
@@ -374,11 +433,19 @@ fn panel_lines(ms: &[f32]) -> Vec<String> {
     let tenths = TENTHS.load(Ordering::Relaxed);
     let fps = if tenths == u32::MAX { "-".to_owned() } else { format!("{}.{}", tenths / 10, tenths % 10) };
     let low = one_percent_low(ms).map_or_else(|| "-".to_owned(), |v| format!("{v:.1}"));
+    // The same over the last ten seconds only: the 1,000 frames above can
+    // still hold a loading screen from a minute ago.
+    let mut total = 0.0;
+    let recent = ms.iter().rev().take_while(|&&m| {
+        total += m;
+        total <= 10_000.0
+    }).count();
+    let low_10s = one_percent_low(&ms[ms.len() - recent..]).map_or_else(|| "-".to_owned(), |v| format!("{v:.1}"));
     let frame = MS_TENTHS.load(Ordering::Relaxed);
     let [cpu, gpu, dropped, making] = DETAIL.each_ref().map(|v| v.load(Ordering::Relaxed));
     let mut lines = vec![
         format!("FPS {fps}"),
-        format!("1% LOW {low}"),
+        format!("1% LOW {low} 10S {low_10s}"),
         format!("FRAME {} MS", frame / 10),
         format!("WORST {:.0} MS", worst_of_second(ms)),
         format!("CPU {cpu} GPU {gpu}"),

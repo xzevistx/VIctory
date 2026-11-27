@@ -373,6 +373,26 @@ pub(crate) fn builder_rests(why: &'static str) {
     }
 }
 
+/// The structure builder's state for the panel's RAYS line (g6-vt2): `OFF`
+/// (not asked for), `WAITING` (asked, its programs not all seen yet),
+/// `STAYS OFF` (one of them has no host pipeline), `RESTING`, `ON`.
+#[cfg(windows)]
+pub(crate) fn builder_state() -> &'static str {
+    if !std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1") {
+        return "OFF";
+    }
+    let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    if b.whole && crate::frame::current() < b.rests {
+        "RESTING"
+    } else if b.whole {
+        "ON"
+    } else if b.off != 0 && b.off == b.pipelines.len() {
+        "STAYS OFF"
+    } else {
+        "WAITING"
+    }
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
@@ -721,6 +741,16 @@ pub(crate) fn note_indirect_prepare(
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
     crate::capture::op(0, || format!("DROPPED {why}"));
+    // The panel's DROPS line (g6-vt2): ray tracing left out, skipped on
+    // purpose, the rest (mostly pipelines still being made).
+    let kind = if why.contains("ray-tracing") || why.contains("BVH") {
+        crate::fpsbox::Note::DropRays
+    } else if why.contains("skipped") {
+        crate::fpsbox::Note::DropSkipped
+    } else {
+        crate::fpsbox::Note::DropOther
+    };
+    crate::fpsbox::note(kind, 1);
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
     *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
 }

@@ -78,7 +78,18 @@ pub(crate) fn claim() {
     if !slots.is_empty() || !slots_on() {
         return;
     }
-    let sizes = [(16usize << 20, 1usize), (64 << 20, 4), (ARENA, 64)];
+    // 64 MiB arenas of memory by address: 4 serve the title without rays;
+    // the structure builder's walks fault in far more, and with 4 the run
+    // rt-c2-builder found "no room left" 4 s after the builder started, its
+    // reads then gave 0 and the picture went black (g6-vt2).
+    // `VICTORY_MEMORY_ARENAS=<n>`; unset: 48 (3 GiB, reserved only) with
+    // `VICTORY_BVH_BUILDER=1`, else 4.
+    let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+    let arenas = std::env::var("VICTORY_MEMORY_ARENAS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(if builder { 48 } else { 4 });
+    let sizes = [(16usize << 20, 1usize), (64 << 20, arenas), (ARENA, if builder { 128 } else { 64 })];
     // Leave the bottom of the title's addressing window free for streamed resources.
     // This switch affects only the early reservations, so later allocations retain their order.
     let top_down = std::env::var_os("VICTORY_UPLOAD_SLOTS_TOP_DOWN").is_some_and(|v| v == "1");
@@ -94,6 +105,12 @@ pub(crate) fn claim() {
     let first = slots.iter().map(|s| s.0).min();
     let end = slots.iter().map(|s| s.0 + s.1).max();
     tracing::info!(slots = slots.len(), bytes = total, top_down, ?first, ?end, "allocations claimed for list uploads and title memory by address");
+}
+
+/// The claimed slots still free, of all (the panel's UPLOAD line, g6-vt2).
+pub(crate) fn slots_free() -> (usize, usize) {
+    let slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    (slots.iter().filter(|s| !s.2).count(), slots.len())
 }
 
 /// Fresh zeroed memory in [4 GiB, 2^37) (where the directory of memory by
@@ -115,7 +132,9 @@ pub(crate) fn reserve(len: usize) -> Option<usize> {
         }
     }
     let at = place(len, true, false);
+    crate::fpsbox::note(crate::fpsbox::Note::UploadOutside, 1);
     if at.is_none() {
+        crate::fpsbox::note(crate::fpsbox::Note::UploadNoRoom, 1);
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(len, "no room left in [4 GiB, 2^37) for list uploads or title memory by address (VICTORY_UPLOAD_POOL_MB claims more at start)"));
     }

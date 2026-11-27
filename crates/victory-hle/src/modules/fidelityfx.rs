@@ -284,6 +284,10 @@ fn use_host_version(
     HOST.set(host)
         .map_err(|_| String::from("FidelityFX provider already initialized"))?;
     tracing::info!(folder = %dir.display(), provider = name, "FidelityFX: selected PC upscaler");
+    // A DLSS chosen first keeps its name: this FSR only stands by.
+    if !dlss::active() {
+        victory_gpu::panel_upscaler(format!("FSR {version}"));
+    }
     Ok(version)
 }
 
@@ -318,6 +322,17 @@ fn start_dlss(
     }
     let setup = dlss::start(dir, logs, quality, ffx_quality)?;
     tracing::info!(%setup, "FidelityFX: NVIDIA DLSS serves the title's upscaler");
+    // NGX's NVSDK_NGX_PerfQuality_Value names.
+    let mode = match quality {
+        0 => "PERFORMANCE",
+        1 => "BALANCED",
+        2 => "QUALITY",
+        3 => "ULTRA PERF",
+        4 => "ULTRA QUALITY",
+        5 => "DLAA",
+        _ => "",
+    };
+    victory_gpu::panel_upscaler(format!("DLSS {mode}").trim_end().to_owned());
     Ok(())
 }
 
@@ -886,6 +901,7 @@ fn record_dispatch(
                 );
             }
             victory_gpu::external::output_written(resource(6));
+            victory_gpu::panel_upscaled("FSR", dispatch.render_size, output_size);
             ctx.first_dispatch.call_once(|| {
                 let backing_extents = textures
                     .each_ref()

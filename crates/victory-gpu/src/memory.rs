@@ -707,6 +707,10 @@ impl Memory {
             }
         }
         self.stats.faults += pages.len() as u64;
+        // The panel's RAYS line (g6-vt2): faulted pages, and those left with
+        // no copy (their reads gave 0: a black picture with the builder on).
+        crate::fpsbox::note(crate::fpsbox::Note::Faults, pages.len() as u64);
+        crate::fpsbox::note(crate::fpsbox::Note::FaultsLeft, (pages.len() - made) as u64);
         // The first frames that leave pages without a copy: all of them, and
         // which of them hold a packed structure's first bytes or lie in a
         // title buffer (to tell walked structures from stray pointers).
