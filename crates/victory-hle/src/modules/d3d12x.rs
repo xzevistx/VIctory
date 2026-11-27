@@ -58,6 +58,14 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
     }
 }
 
+/// Cache identity for shader pretranslation on this host.
+pub fn precompile_cache_key() -> Option<[u8; 32]> {
+    #[cfg(windows)]
+    { victory_gpu::shader_cache::precompile_cache_key() }
+    #[cfg(not(windows))]
+    { None }
+}
+
 /// Of the cached translations met since the start: those an earlier build
 /// of the translator made, those translated again, and those that came out
 /// different (`victory_gpu::shader_cache`).

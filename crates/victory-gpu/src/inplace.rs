@@ -385,6 +385,24 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     }
 }
 
+/// Whether any page of `[start, end)` has another title view, including
+/// pages shared too widely to enumerate for write watching.
+pub(crate) fn has_alias(start: usize, end: usize) -> bool {
+    let v = views();
+    if start >= end || v.pages_twice == 0 {
+        return false;
+    }
+    let first = v.views.range(..=start).next_back()
+        .filter(|(base, view)| *base + view.0 > start).map(|(base, _)| *base);
+    v.views.range(first.unwrap_or(start)..end).any(|(&base, &(bytes, section, offset))| {
+        let page = start.max(base) & !(K64 - 1);
+        (page..end.min(base + bytes)).step_by(K64).any(|page| {
+            v.pages.get(&(section, offset + (page - base) as u64))
+                .is_some_and(|shown| shown.len() > 1)
+        })
+    })
+}
+
 /// The 64 KiB pages of `[start, end)` that the title shows at other
 /// addresses too, in address order, each with those; not the ones it shows
 /// in very many views (`crate::watch::MANY_VIEWS`).

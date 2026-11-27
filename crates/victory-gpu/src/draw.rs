@@ -18,7 +18,8 @@ use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_X24_TYPELESS_G8_UINT, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
+    DXGI_FORMAT, DXGI_FORMAT_R24_UNORM_X8_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+    DXGI_FORMAT_X24_TYPELESS_G8_UINT, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
 };
 use windows::core::Interface;
 
@@ -35,6 +36,36 @@ fn is_depth_srv(desc: &[u32; 10]) -> bool {
     desc[1] == D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32
         && desc[6] == 0
         && !matches!(format, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT | DXGI_FORMAT_X24_TYPELESS_G8_UINT)
+}
+
+/// Accept a depth view of the same subresources as a bound stencil view.
+fn is_depth_companion(stencil: &View, depth: &View) -> bool {
+    let (stencil_desc, depth_desc): (&[u32], &[u32]) = match (stencil, depth) {
+        (View::Shader(a, Some(stencil)), View::Shader(b, Some(depth))) if a == b && *a != 0 => {
+            (stencil, depth)
+        }
+        (View::Placed(false, _, stencil_desc), View::Placed(false, _, depth_desc))
+            if crate::descriptor::host::same_placed_texture(stencil, depth) =>
+        {
+            (stencil_desc, depth_desc)
+        }
+        _ => return false,
+    };
+    let format = |view: &[u32]| DXGI_FORMAT(crate::resource::pc_format(view[0]) as i32);
+    let expected = match format(stencil_desc) {
+        DXGI_FORMAT_X32_TYPELESS_G8X24_UINT => DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+        DXGI_FORMAT_X24_TYPELESS_G8_UINT => DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+        _ => return false,
+    };
+    let texture_2d = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
+    stencil_desc[1] == texture_2d
+        && depth_desc[1] == texture_2d
+        && stencil_desc[6] == 1
+        && depth_desc[6] == 0
+        && format(depth_desc) == expected
+        && depth_desc[2] == D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+        && stencil_desc[4..6] == depth_desc[4..6]
+        && stencil_desc[7] == depth_desc[7]
 }
 
 /// Shader interface metadata shared by every pipeline variant and draw.
@@ -598,6 +629,33 @@ impl State {
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
+    }
+
+    /// Number of dynamic descriptor slots still held by this list waiting for
+    /// retirement.
+    #[cfg(any(test, feature = "diagnostics"))]
+    pub(crate) fn pending_dynamic_slots(&self) -> u64 {
+        self.dynamic.iter().map(|&(_, _, _, n)| u64::from(n)).sum()
+    }
+}
+
+#[cfg(test)]
+mod dynamic_slot_tests {
+    use super::State;
+
+    #[test]
+    fn pending_dynamic_slots_clears_after_tables_done() {
+        let mut state = State::default();
+        assert_eq!(state.pending_dynamic_slots(), 0);
+        // Unknown heap addresses: `release_dynamic` is a safe no-op.
+        state.dynamic.push((0x1000, 1, 0, 12));
+        state.dynamic.push((0x1000, 1, 16, 4));
+        assert_eq!(state.pending_dynamic_slots(), 16);
+        state.tables_done();
+        assert_eq!(state.pending_dynamic_slots(), 0);
+        // Idempotent second call (as `list::ran` does after `Detached::release_tables`).
+        state.tables_done();
+        assert_eq!(state.pending_dynamic_slots(), 0);
     }
 }
 
@@ -3477,14 +3535,30 @@ impl State {
         t.used.iter().find(|u| {
             u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
         })?;
-        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
-            return None;
-        };
-        let view = crate::descriptor::view(table + u64::from(offset) * 4)?;
-        let view = crate::descriptor::host::placed_texture(&view).unwrap_or(view);
-        let resource = match (kind, view) {
-            (ResourceType::Srv, View::Shader(r, desc)) if desc.as_ref().is_none_or(is_depth_srv) => r,
-            (ResourceType::Uav, View::Unordered(r, ..)) => r,
+        let view = self.bound_table_view(compute, (slot, offset))?;
+        let placed = crate::descriptor::host::placed_texture(&view);
+        let ((slot, offset), resource) = match (kind, placed.as_ref().unwrap_or(&view)) {
+            (ResourceType::Srv, View::Shader(r, desc)) if desc.as_ref().is_none_or(is_depth_srv) => {
+                ((slot, offset), *r)
+            }
+            (ResourceType::Uav, View::Unordered(r, ..)) => ((slot, offset), *r),
+            (ResourceType::Srv, _) if compute && (slot, offset) == crate::ambient::DEPTH => {
+                // The diffuse resolve can bind the stencil plane at the usual
+                // slot. Use a depth view already read by the same dispatch.
+                let (at, depth) = t.used.iter()
+                    .filter(|u| u.kind == ResourceType::Srv && u.root == RootType::Table)
+                    .map(|u| (u.slot, u.table_offset_dwords))
+                    .filter(|at| *at != (slot, offset))
+                    .find_map(|at| {
+                        let depth = self.bound_table_view(compute, at)?;
+                        is_depth_companion(&view, &depth).then_some((at, depth))
+                    })?;
+                let placed = crate::descriptor::host::placed_texture(&depth);
+                let View::Shader(resource, _) = placed.as_ref().unwrap_or(&depth) else {
+                    return None;
+                };
+                (at, *resource)
+            }
             _ => return None,
         };
         let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
@@ -3494,7 +3568,14 @@ impl State {
         let host = crate::resource::host_resource(resource as This)?;
         // SAFETY: a live resource.
         let desc = unsafe { host.GetDesc() };
-        Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
+        Some((desc, heap.gpu_handle(start.checked_add(offset.checked_mul(4)?)? / 32)))
+    }
+
+    fn bound_table_view(&self, compute: bool, (slot, offset): (u8, u32)) -> Option<View> {
+        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            return None;
+        };
+        crate::descriptor::view(table.checked_add(u64::from(offset) * 4)?)
     }
 
     /// The place in the bound view heap of the view a shader of the bound
@@ -4185,6 +4266,10 @@ impl State {
                                 }
                                 None => crate::port_cbv::copied(true),
                             }
+                        }
+                        if let Some((buffer, gpu)) = list.snapshot_placed_constants(address, size) {
+                            host.constant_at(index, &buffer, gpu, size);
+                            continue;
                         }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);
@@ -5357,7 +5442,7 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_depth_srv, staging_budget_per_frame};
+    use super::{View, is_depth_companion, is_depth_srv, staging_budget_per_frame};
 
     #[test]
     fn depth_srv_checks_the_plane_not_the_number_of_levels() {
@@ -5377,6 +5462,20 @@ mod tests {
         desc[0] = DXGI_FORMAT_R24_UNORM_X8_TYPELESS.0 as u32;
         desc[1] = D3D12_SRV_DIMENSION_TEXTURE2DARRAY.0 as u32;
         assert!(!is_depth_srv(&desc));
+    }
+
+    #[test]
+    fn the_reported_stencil_view_requires_its_matching_depth_plane() {
+        let words = [22, 4, 5768, 0, 0, 1, 1, 0, 0, 0];
+        let stencil = View::Shader(1, Some(words));
+        let mut depth = words;
+        depth[0] = 21;
+        depth[6] = 0;
+        assert!(!is_depth_companion(&stencil, &stencil));
+        assert!(is_depth_companion(&stencil, &View::Shader(1, Some(depth))));
+        assert!(!is_depth_companion(&stencil, &View::Shader(2, Some(depth))));
+        depth[4] = 1;
+        assert!(!is_depth_companion(&stencil, &View::Shader(1, Some(depth))));
     }
 
     #[test]

@@ -139,8 +139,11 @@ pub(crate) fn describe() -> Option<String> {
 /// output as upstream has it.
 const G6_AMBIENT: &str = "0.8";
 const G6_AIR: &str = "2";
-const G6_REFLECT: &str = "2";
-const G6_REFLECT_IN: &str = "CombinedReflections";
+// The reflection resolves' names and strength as upstream documents them
+// (TaynanGT/Vice-Tay 55d0dfc, docs/fork-ray-tracing.md; from
+// avatarmanz/VIctory-7900XTX#314). "CombinedReflections" was a guess.
+const G6_REFLECT: &str = "1";
+const G6_REFLECT_IN: &str = "CS_TemporalResolve2_Opaque,CS_TemporalResolve1_Alpha";
 
 fn set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();

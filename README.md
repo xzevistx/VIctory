@@ -6,11 +6,11 @@
 
 Vice-Tay builds on [VIctory](https://github.com/Marvisak/VIctory) to run an Xbox Series title from your own files. The title's x86-64 code runs on the host CPU. The compatibility layer provides the console APIs it calls and translates its graphics work to Direct3D 12.
 
-[Quick start](#getting-started) · [Gameplay](#gameplay) · [Measurements](#measurements) · [Benchmark dashboard](https://taynangt.github.io/Vice-Tay/)
+[Quick start](#getting-started) · [Gameplay](#gameplay) · [Measurements](#measurements) · [Measurements on GitHub Pages](https://taynangt.github.io/Vice-Tay/)
 
 ## Measurements
 
-The goal is **30 rendered FPS in the open world with correct visuals**. Both sessions used the Series S profile.
+The goal is **30 rendered FPS in the open world with correct visuals**. The recorded sessions below used the Series S profile on the indicated revisions.
 
 | Session | Result |
 | --- | --- |
@@ -71,11 +71,15 @@ https://github.com/user-attachments/assets/bd07891c-c53f-4f46-9b7e-80463c379b84
 
 Use [`Play-VIctory.cmd`](Play-VIctory.cmd) to pass the same options from Command Prompt. Double-click it to enter the executable's path at a prompt. The launcher defaults to full screen, the Series X profile and an automatic GPU preset. **F11** or **Alt+Enter** toggles full screen during play.
 
+If the title reaches the menu but stops at world load, verify your title files before changing graphics settings. Compare the full file hashes against a trusted manifest for the exact release you own, using the algorithm listed in that manifest. An archive with missing or zero-filled data can still have the expected size. Re-copy any mismatched files from your verified source and check the hashes again before launching.
+
 | Option | Use it to |
 | --- | --- |
 | `-Console series-s` | Select the lighter console profile used in the sessions above. |
 | `-Machine 4090` / `-Machine 4070` / `-Machine 7900xtx` | Select a GPU preset explicitly. See the [RTX 4070 test notes](docs/rtx4070-performance.md). |
+| `-Machine 4070tisuper` | The RTX 4070 Ti SUPER (16 GB) preset, asked for explicitly. With Resizable BAR on, it moves up to 4 GB of shader-read windows from RAM into the card's memory. Also [measured on an RTX 5080 with eight cores](docs/rtx5080-16gb.md), where it ran one scene at 27 fps against 16 with the RTX 4090 settings. |
 | `-Machine laptop` | Try the [16 GB NVIDIA laptop preset](docs/laptop-16gb.md), measured on one RTX 3050 laptop. |
+| `-Machine 3060` | Try the [six-core, 16 GB NVIDIA desktop preset](docs/rtx3060-16gb.md), measured on one RTX 3060 12 GB / i5-12400F PC. |
 | `-Safe` | Launch with the conservative settings when investigating a graphics or stability issue. |
 | `-Windowed` / `-NoPanel` | Start in a window or hide the diagnostics overlay at launch. |
 | `-RayTracing` | Enable the structures needed for the title's ray-traced indirect lighting. |
@@ -127,7 +131,7 @@ through beloooo's port. The frame generation bridge follows
 <details>
 <summary>Shader cache and pipeline warm-up</summary>
 
-The launcher pretranslates shaders when the cache has fewer than 1,000 entries. It uses `game_dir` when configured and falls back to the executable's directory. The driver may still build pipelines during the first run.
+The launcher pretranslates shaders when it has no completed scan for the current shader cache key and source paths. On Windows it uses `game_dir` when configured and falls back to the executable's directory. The driver may still build pipelines during the first run.
 
 Run these steps separately from the repository root to warm the shader cache and compile pipelines seen in previous runs. Both steps can resume from cached work.
 
@@ -169,11 +173,19 @@ bash linux/wineserver/build.sh
 
 Restart Steam and pick `GE-Proton11-14-viewtree`. GE-Proton's `master` already carries an equivalent change ([`em-fixups/0078-server-store-process-views-in-an-rb-tree.patch`](https://github.com/GloriousEggroll/proton-ge-custom/blob/master/patches/wine-hotfixes/em-fixups/0078-server-store-process-views-in-an-rb-tree.patch)); once a GE-Proton release includes it, this build is no longer needed. On one RTX 5080 (Series S profile, the same build and settings), the opening area ran at 2.7 to 4 fps with 190 to 294 ms of copies a frame on stock GE-Proton11-14, and at about 20 fps with 22 to 25 ms on the patched server.
 
+[`linux/play.sh`](linux/play.sh) starts a build cross-compiled with `cargo xwin build --target x86_64-pc-windows-msvc` on GE-Proton11-14's Wine, outside Steam, with the launcher's NVIDIA settings and no network. It uses `GE-Proton11-14-viewtree` when built. The Wine prefix needs Microsoft's `d3dcompiler_47.dll`, because Wine's own compiler rejects the HLSL Vice-Tay compiles at runtime; the script's header shows the `winetricks` line.
+
+```sh
+GAME=/path/to/title linux/play.sh series-s
+```
+
+DLSS also runs under Proton. Set `PROTON_ENABLE_NVAPI=1` and point `VICTORY_DLSS_DIR` at a folder that holds `nvngx_dlss.dll` (from [NVIDIA's DLSS SDK](https://github.com/NVIDIA/DLSS), `lib/Windows_x86_64/rel`). For example, add `PROTON_ENABLE_NVAPI=1 VICTORY_DLSS=quality VICTORY_DLSS_DIR="Z:/path/to/dlss"` to the launch options. On one RTX 5080 (Series S profile, GE-Proton11-14-viewtree, NVIDIA 620.73.04, DLSS 310.9.16), the log showed `NVIDIA DLSS serves the title's upscaler` and `DLSS: 1000 frames evaluated` at 1280 × 720 to 1920 × 1080; on that setup NGX found the driver's files through the environment at `/run/host/usr/lib/nvidia/wine` and turned its updater off under Wine. In two short runs on that machine in the opening area, the in-world median was 19.8 fps (7,233 draws a frame) with the title's own upscaler and 22.8 fps (7,019 draws a frame) with DLSS Quality, and the copies 27.5 and 18.5 ms a frame: DLSS replaces the title's own upscaler passes, along with the copies of their results.
+
 </details>
 
 ## Known problems
 
-- **RX 6700 XT on Windows 11 LTSC.** Drivers 32.0.21045.26001 and 32.0.32029.2010 can reset the device while loading the world. The AMD launcher profile defaults to relay mode 0 on those drivers. See [#138](https://github.com/TaynanGT/Vice-Tay/issues/138) for the reported runs. The launcher still accepts an explicit relay mode through its settings override.
+- **RDNA2 world-load resets on Windows 11.** The AMD launcher profile defaults to relay mode 0 on the RX 6700 XT with drivers 32.0.21045.26001 or 32.0.32029.2010 on LTSC, and on the RX 6900 XT with driver 32.0.21045.29003 on all Windows 11 editions. The launcher accepts an explicit relay mode through its settings override. See the test reports in [#138](https://github.com/TaynanGT/Vice-Tay/issues/138).
 - **Frame time.** The 30-minute run recorded a median frame time of 47.3 ms, with 33.7 ms for CPU-side submission preparation and 12.6 ms for GPU read-back. [Frame breakdown](docs/measurements.md#series-s-baseline)
 - **Memory pressure.** The five-minute overlay session peaked at 27.1 GB of private game memory. Low free RAM can lead to paging and long stalls. [Memory findings](docs/findings-rtx4090.md)
 - **Rendering.** Colour banding, flat-colour surfaces, blocky clouds and reflections, and missing or incorrect shading remain visible in some scenes. Ray-traced indirect lighting requires `-RayTracing`.

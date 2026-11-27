@@ -47,7 +47,8 @@ user's dump), `test_titles`, and `cache_dir` for everything derived
 2. `cargo xtask policy` (run by the pre-commit hook; install with
    `cargo xtask install-hooks`) is an allowlist: files must have an allowed
    type, be under 640 KiB, contain no binary data or known binary
-   signatures, and hold no long hex/base64 runs. Exceptions need an entry
+   signatures, and hold no long hex/base64 runs or large decimal-byte
+   arrays. Exceptions need an entry
    with a reason in `xtask/src/policy.rs`.
 3. At runtime, everything that writes derived data calls
    `victory_core::ensure_outside_repo`.

@@ -13,8 +13,14 @@ where there is one; the default is the behaviour described.
   screen while the title runs; the picture is stretched to either. DXGI's own
   Alt+Enter, which would make the swap chain exclusive full screen, is turned off.
 - **Settings for an RTX 4090 / Ryzen 9 9950X3D / 48 GB** (`scripts\play.ps1
-  -Machine 4090`, picked for any NVIDIA card; `-Machine laptop` for 16 GB of RAM,
-  [laptop-16gb.md](laptop-16gb.md)): the thread counts and switches
+  -Machine 4090`; `-Machine auto` uses the same NVIDIA rendering settings with
+  worker counts sized to the CPU and, for a card of 10 to 19 GB, the memory
+  settings of `-Machine 4070` or `4070tisuper`; `-Machine laptop` for 16 GB of RAM,
+  [laptop-16gb.md](laptop-16gb.md); `-Machine 3060` for a six-core desktop with
+  16 GB, [rtx3060-16gb.md](rtx3060-16gb.md); `-Machine 4070tisuper` for a 16 GB
+  card and eight cores, measured on an RTX 5080 in
+  [rtx5080-16gb.md](rtx5080-16gb.md), which also lists what `auto` adds by the
+  card and the CPU): the thread counts and switches
   `scripts\play.ps1` sets. `-Safe` keeps the wave-wide list there: without it four
   wave64 programs do not translate on a 32-lane card and their draws are dropped.
 - **A performance panel** in the top-left corner (diagnostics builds; on by
@@ -53,6 +59,28 @@ How each of these was found, with the numbers:
   default. Making one holds a global lock; on a card whose view heap has no raw
   twins (NVIDIA) every such view took it, and the list threads queued on it down
   to 6 fps (`VICTORY_STRUCTURED_RAW=1` makes the copies).
+- **Constant buffers written by placed copies.** With
+  `VICTORY_PLACED_CONSTANTS=1`, a draw can bind a GPU snapshot of the bytes an
+  earlier placed copy wrote. The command list can reuse that snapshot across
+  draws until a write overlaps the same bytes. The option is off by default.
+- **GPU fills behind placed copies.** Set `VICTORY_PLACED_FILL_REDIRECT=1`
+  with `VICTORY_PLACED_ORDER=1` to let compatible fills read the recorded
+  source of an earlier placed copy. The copy must cover the entire fill.
+  If a CPU reader still depends on a pending copy, submission waits for the
+  bytes to become available. This path is off by default.
+- **Reuse lazy state preludes** with `VICTORY_PRELUDE_POOL=1`. The pool
+  takes the allocator and command list back after the owning list resets,
+  once its prior submission has finished. It holds up to 128 idle pairs.
+  To try it on the reported RX 6900 XT setup, add
+  `-More @{VICTORY_PRELUDE_POOL='1'}` to the same Series S launch. The pool-on
+  run loaded the world, and the creation count stayed at 155 for 67 seconds
+  under memory pressure.
+  A separate Windows Sandbox test on an RTX 5090 D v2 made 831 preludes with
+  the pool off and 186 with it on. These are endpoint counts for allocator
+  reuse. Keep the save, relay settings, resolution and cache the same when
+  comparing stability or frame times.
+  [RX 6900 XT report](https://github.com/TaynanGT/Vice-Tay/issues/93#issuecomment-7217111392) ·
+  [RTX 5090 D v2 report](https://github.com/TaynanGT/Vice-Tay/pull/211#issuecomment-7218626007)
 
 ## Picture
 
@@ -73,10 +101,26 @@ How each of these was found, with the numbers:
     first then waited on the host for threads that never came);
   - an operand ending at `v255` counts `v255`;
   - a lane write (`v_writelane`) inside a region a branch skips keeps the skip.
-- The translator's version is 2: the shader cache translates again what version 1
-  made.
+  - **paired lanes**: a console wave of 64 runs in one host wave of 32, each thread
+    lowering two console lanes, so wave-wide sums, first-lane reads and LDS shared
+    within the console wave are exact (after ByFxbian's #1397 and #1419 on
+    fxceless/victory-fork). 29 programs take this form by default, the ones whose
+    other forms left the picture wrong: the tiled shadow mask (stair-stepped shadow
+    tiles), the water's transmission volumetrics and tile generation (dark blocks on
+    open water, the view under water) and atmospheric diffusion with its depth scan (a halo at
+    silhouettes against the sky). `VICTORY_WAVE_PAIRS_ONLY=<log hashes>` names other
+    programs (`none`: none), `VICTORY_WAVE_PAIRS=1` tries the form for every wave64
+    compute program that needs it, and `VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz`
+    confirms the guest float mode for the ordered FP32 reductions of programs that
+    are not on the default list.
+- The shader cache rebuilds entries when the translator version changes.
 
 ## Loading and the runtime
+
+- Set `VICTORY_MAPPING_WAIT_MS` to a positive number of milliseconds to limit
+  the wait for the GPU memory-mapping fence. After a timeout, the runtime
+  checks that same fence before reusing its command list or submitting a
+  new mapping marker.
 
 - **DirectStorage**: a queue submits itself when it holds half its capacity, unless
   the title created it with automatic submission off (`DSTORAGE_QUEUE_OPTIONS`).
@@ -98,7 +142,21 @@ How each of these was found, with the numbers:
 - **Scripted keys** (`VICTORY_KEYS_FILE`): the file is taken by renaming it before
   it is read, so a batch written meanwhile is never deleted unread.
 
+- **DSP convolution.** Add `-More @{VICTORY_DSP_CONVOLUTION='1'}` to test the
+  host convolution path for phone calls and other filtered audio. Compare
+  the same call with the option off and on, at the same volume.
+  [Upstream test](https://github.com/Marvisak/VIctory/pull/3332)
+- **Mono DSP comparison.** Add `-More @{VICTORY_DSP_MONO_PASSTHROUGH='1'}`
+  to pass readable mono DSP input through at unity gain when convolution
+  cannot produce output. Compare the same phone call and audio settings
+  with passthrough off and on. [Dialogue report](https://github.com/TaynanGT/Vice-Tay/issues/259)
+
 ## Measuring
+
+With a diagnostics build, add `-More @{VICTORY_JOIN_REASONS='1'}` to log why
+the submission lane stopped joining work. The per-frame line separates a
+queue boundary, a wait, the configured limits, and submission dependencies.
+Compare it alongside the number of joined submissions in the same interval.
 
 - Every host list that ran is kept for reuse.
 - Frame dumps (`VICTORY_CAPTURE`) are encoded on a thread of their own, and the

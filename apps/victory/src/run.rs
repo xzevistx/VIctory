@@ -432,7 +432,7 @@ pub fn run(
         return Ok(());
     }
     victory_loader::report_crashes();
-    victory_loader::set_before_thread_shutdown(victory_hle::known_pipelines::flush);
+    victory_loader::set_before_thread_shutdown(last_saves);
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
@@ -453,9 +453,17 @@ pub fn run(
     let code = main.join();
     victory_hle::modules::fidelityfx::shut_down();
     let code = code.map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
-    victory_hle::known_pipelines::flush();
+    last_saves();
     println!("title exited with {code}");
     Ok(())
+}
+
+/// What is put on disk when the title exits, while the layer's threads can
+/// still work: the pipelines it is known to make, and the capture pictures
+/// still in the line of the thread that writes them.
+fn last_saves() {
+    victory_hle::known_pipelines::flush();
+    victory_hle::finish_captures();
 }
 
 /// The debugging aids (README): scheduled stack dumps, watched values and

@@ -44,7 +44,26 @@ The game sets its own ceiling in every run (`working set ceiling 4500 MB: set`),
 
 ### Longer sessions
 
-Without a throttle, free RAM in the world touches a few MB at moments, and the guard stopped both runs above after about 160 s in the world. The RAM throttle (#96) keeps free RAM above about 400 MB through 240 s runs, but its waits hold the title's main loop back. **With the watchdog on, a throttled world load is ended by the watchdog** (0 of 6 such loads passed, with submission waits of 1,000, 300 or 0 ms). #126 lets the throttle tick the title's heartbeat during its own waits. With #96 and #126 (and the throttle at a 1,500 MB floor, 500 ms per buffer, 900 ms a second, 1,000 ms per submission, windows on the card up to 92 % of its budget), 4 of 4 loads passed, and 3 of them ran the full 240 s (one met the guard 55 s into the world): about 176 s in the world, 112–122 frames, a median frame of 1.37–1.47 s.
+Without a throttle, free RAM in the world touches a few MB at moments, and the guard stopped both runs above after about 160 s in the world. The RAM throttle (#96) keeps free RAM above about 400 MB through 240 s runs, but its waits hold the title's main loop back. In the earlier #96 tests, the watchdog stopped all six throttled world loads, with submission waits of 1,000, 300 or 0 ms. #126 lets the throttle tick the title's heartbeat during its own waits. With #96 and #126 (and the throttle at a 1,500 MB floor, 500 ms per buffer, 900 ms a second, 1,000 ms per submission, windows on the card up to 92 % of its budget), 4 of 4 loads passed, and 3 of them ran the full 240 s (one met the guard 55 s into the world): about 176 s in the world, 112–122 frames, a median frame of 1.37–1.47 s.
+
+### Watchdog-on runs with the list pool disabled
+
+On the same 16 GB laptop, [seven later runs](https://github.com/TaynanGT/Vice-Tay/pull/147#issuecomment-7213344061)
+used Series S and `-Machine laptop` with
+`-More @{VICTORY_LIST_POOL='0'; VICTORY_OUTPUT='1280x720'; VICTORY_RENDER_SCALE='0.75'}`.
+The control was `main` at `791648b`. The experimental #147 build used a 600 MiB
+RAM floor, a 250 ms per-buffer wait and a 600 ms shared wait per second.
+
+| Setting | Passed the world load | World median frame |
+|---|---:|---:|
+| Control | 3 of 3 | 548–881 ms |
+| Buffer waits | 2 of 2 | 1,059–1,150 ms |
+| Buffer waits plus a 300 ms submission wait | 1 of 2 | 687 ms in the completed run |
+
+The last run ended at the watchdog after heavy paging, with one submission
+wait and no buffer waits. The throttle remains experimental. The launcher
+prints the executable path and SHA-256 so each recorded run can be tied
+to the binary it used.
 
 ### Measured options and dead ends (on top of the above with #96 and #126, 2 runs each)
 

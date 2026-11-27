@@ -112,6 +112,9 @@ enum Command {
     /// In diagnostics builds, VICTORY_LOG=debug shows skipped paths.
     Shaders {
         paths: Vec<PathBuf>,
+        /// Skip the scan if these paths have already been translated for this cache key.
+        #[arg(long, conflicts_with = "list")]
+        if_needed: bool,
         /// Worker threads (default: every logical core).
         #[arg(long, value_parser = parse_jobs)]
         jobs: Option<usize>,
@@ -124,6 +127,7 @@ enum Command {
     /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
     /// driver's cache on disk has them before a run needs one: once per change
     /// of the translator or the driver. Goes on where it was stopped.
+    /// `VICTORY_WARM_BAD=0` ignores the quarantine in `warm-bad.txt`.
     #[cfg(windows)]
     Warm {
         /// Processes at once (default: two thirds of the logical cores).
@@ -132,7 +136,7 @@ enum Command {
         /// At most this many pipelines.
         #[arg(long)]
         limit: Option<usize>,
-        /// Those made before too.
+        /// Retry completed and quarantined pipelines too.
         #[arg(long)]
         again: bool,
         /// Only the pipelines earlier runs drew with.
@@ -238,7 +242,7 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs, wave)
         }
-        Command::Shaders { paths, jobs, list } => translate::precompile(paths, jobs, list),
+        Command::Shaders { paths, jobs, list, if_needed } => translate::precompile(paths, jobs, list, if_needed),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         Command::Run {

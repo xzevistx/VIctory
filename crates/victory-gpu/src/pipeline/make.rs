@@ -89,6 +89,22 @@ fn left_out(shaders: &[Arc<Shader>], skip_hashes: &[String]) -> Option<&'static 
     if super::skipped_in_list(shaders, skip_hashes).is_some() {
         return Some("skipped by VICTORY_SKIP_PIPELINES");
     }
+    // `VICTORY_SKIP_NAMED=<text>[,<text>]` (g6-vt2): compute programs with
+    // any of these texts in their names are left out, to find which pass a
+    // fault comes from without knowing its hashes.
+    static NAMED: OnceLock<Vec<String>> = OnceLock::new();
+    let named_skips = NAMED.get_or_init(|| {
+        std::env::var("VICTORY_SKIP_NAMED")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned)
+            .collect()
+    });
+    if named_skips.iter().any(|t| named(shaders, t.as_bytes())) {
+        return Some("skipped by VICTORY_SKIP_NAMED");
+    }
     None
 }
 

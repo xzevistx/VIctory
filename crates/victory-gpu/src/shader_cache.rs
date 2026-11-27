@@ -40,6 +40,7 @@ static MISSES: AtomicU64 = AtomicU64::new(0);
 static STALE: AtomicU64 = AtomicU64::new(0);
 static REFRESHED: AtomicU64 = AtomicU64::new(0);
 static CHANGED: AtomicU64 = AtomicU64::new(0);
+static WRITE_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// The build of the translator (the BLAKE3 of its sources, `build.rs`).
 const SOURCE: &str = env!("VICTORY_TRANSLATOR");
@@ -130,6 +131,9 @@ fn build() -> [u8; 32] {
             "VICTORY_SCC_LOCAL_ANY",
             "VICTORY_UINT_LIGHTS",
             "VICTORY_WAVE_NATIVE",
+            "VICTORY_WAVE_PAIRS",
+            "VICTORY_WAVE_PAIRS_ONLY",
+            "VICTORY_WAVE_PAIRS_FP32",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -162,6 +166,22 @@ fn build() -> [u8; 32] {
 /// What tells one set of translations from another ([`build`]).
 pub(crate) fn translation() -> [u8; 32] {
     build()
+}
+
+/// Identifies a completed batch of cached translations, including the
+/// per-shader override that is deliberately outside the global cache key.
+pub fn precompile_cache_key() -> Option<[u8; 32]> {
+    CACHE.get()?;
+    if WRITE_FAILED.load(Ordering::Relaxed) {
+        return None;
+    }
+    crate::host::host()?;
+    let mut key = blake3::Hasher::new();
+    key.update(&build());
+    if let Some(only) = std::env::var_os("VICTORY_WAVE_WIDE_ONLY") {
+        key.update(only.as_encoded_bytes());
+    }
+    Some(*key.finalize().as_bytes())
 }
 
 /// Puts the translation of `container` into the cache before any title asks
@@ -277,8 +297,7 @@ fn cached_by(
             match entry {
                 Ok(path) => tracing::debug!(path = %path.display(), "shader translated and cached"),
                 Err(error) => {
-                    static WARNED: AtomicBool = AtomicBool::new(false);
-                    if !WARNED.swap(true, Ordering::Relaxed) {
+                    if !WRITE_FAILED.swap(true, Ordering::Relaxed) {
                         tracing::warn!(%error, "shader cache write failed; using the translation in memory");
                     }
                 }

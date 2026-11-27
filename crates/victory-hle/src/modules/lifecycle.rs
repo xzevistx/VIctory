@@ -163,7 +163,7 @@ fn place(
     width: i32,
     height: i32,
 ) -> (Windowed, Option<WindowState>) {
-    if !placeable(ex_style, style, !parent.is_null()) || width == 0 || height == 0 {
+    if !placeable(ex_style, style, !parent.is_null()) || zero_sized(style, width, height) {
         return ((ex_style, style, (x, y, width, height)), None);
     }
     // Use the chosen monitor's work area for the windowed size and its
@@ -185,6 +185,17 @@ fn place(
         tracing::info!(width = screen.0, height = screen.1, left = origin.0, top = origin.1, "title window made full screen");
     }
     (if full_screen { full } else { windowed }, Some(WindowState { windowed, full_screen }))
+}
+
+/// Whether a window asks for no area of its own. Win32 supplies a default
+/// size to overlapped windows, and uses zero size for a pop-up or child
+/// with a default width.
+fn zero_sized(style: u32, width: i32, height: i32) -> bool {
+    match width {
+        wm::CW_USEDEFAULT => style & (wm::WS_POPUP | wm::WS_CHILD) != 0,
+        0 => true,
+        _ => height == 0,
+    }
 }
 
 /// The styles and place the title's top-level window had (or would have
@@ -706,6 +717,9 @@ fn end() {
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();
+    // Capture pictures still in the line of the thread that writes them.
+    #[cfg(windows)]
+    victory_gpu::finish_captures();
     // DLSS's features and NGX, before the device goes with the process.
     #[cfg(windows)]
     crate::modules::fidelityfx::shut_down();
@@ -773,6 +787,36 @@ mod tests {
         let (placed, state) = place(wm::WS_EX_TOOLWINDOW, wm::WS_POPUP, parent, 25, 60, 3000, 2000);
         assert_eq!(placed, (wm::WS_EX_TOOLWINDOW, wm::WS_POPUP, (25, 60, 3000, 2000)));
         assert!(state.is_none(), "the tool window keeps its placement");
+    }
+
+    /// A default-sized window (`CW_USEDEFAULT` width; Windows ignores the height, here 0) is
+    /// a normal window: placed, and kept for full screen and its toggle; a width of 0 is not.
+    #[test]
+    fn a_default_width_with_zero_height_is_not_a_zero_sized_helper() {
+        let default = wm::CW_USEDEFAULT;
+        let style = wm::WS_OVERLAPPEDWINDOW;
+        assert!(!zero_sized(style, default, 0));
+        assert!(!zero_sized(style, default, default));
+        assert!(zero_sized(style, 0, 0));
+        assert!(zero_sized(style, 0, 600));
+        assert!(zero_sized(style, 800, 0));
+        let (_, state) = place(
+            wm::WS_EX_APPWINDOW, style, std::ptr::null_mut(), default, 0, default, 0,
+        );
+        assert!(state.is_some(), "the default-sized window keeps its full-screen state");
+    }
+
+    #[test]
+    fn a_popup_with_default_width_keeps_its_native_zero_size() {
+        let default = wm::CW_USEDEFAULT;
+        let style = wm::WS_POPUP;
+        assert!(zero_sized(style, default, 0));
+        assert!(zero_sized(style, default, 600));
+        assert!(zero_sized(wm::WS_CHILD, default, 600));
+        assert!(!zero_sized(style, 800, 600));
+        let (placed, state) = place(0, style, std::ptr::null_mut(), 10, 20, default, 0);
+        assert_eq!(placed, (0, style, (10, 20, default, 0)));
+        assert!(state.is_none());
     }
 
     /// `VICTORY_MONITOR`: a device name with or without its prefix, any

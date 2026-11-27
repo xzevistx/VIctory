@@ -867,13 +867,29 @@ fn note_shared(written: &[(usize, u16)]) -> u64 {
     now
 }
 
+/// Whether known view memory skips `GetWriteWatch` even without
+/// `VICTORY_PORT_GUARD=1` (`VICTORY_SKIP_VIEW_ASK=0` disables; on by default).
+/// Avoids ~215 refused kernel askings per frame (and binary-search halving of
+/// combined ranges) without enabling `PORT_GUARD`'s parallel `mprotect` path.
+fn skip_view_ask() -> bool {
+    if port_guard() {
+        return true;
+    }
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_SKIP_VIEW_ASK") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_VIEW_ASK").is_none_or(|v| v != "0"))
+}
+
 /// Whether the kernel would refuse to ask about `[start, end)` for its view
 /// memory (renderer port #6): read-only by our hand, or known a view
 /// ([`VIEWS`]). Such a range is left to [`writes`], which goes to the guards
 /// at once; asked with others it failed their asking too, which was then
 /// asked again by halves.
 fn refused_as_view(start: usize, end: usize) -> bool {
-    if !port_guard() || !light() {
+    if !skip_view_ask() || !light() {
         return false;
     }
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
@@ -1060,9 +1076,11 @@ pub(crate) fn once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE").is_none_or(|v| v != "0"))
 }
 
-/// Tests that go through the submission's one asking ([`ask_once`]) hold
-/// this while they run: the asking is global, so two tests asking at once end
-/// each other's, and a write one of them waits for can be taken by the other.
+/// Tests that go through the submission's one asking ([`ask_once`]), or that
+/// guard views of their own, hold this while they run: the asking and the
+/// guards are global, so two tests asking at once end each other's, and a
+/// write one of them waits for can be taken by the other. A view one test maps
+/// beside another's guarded block makes that block be told as written again.
 #[cfg(test)]
 pub(crate) fn one_asking_test() -> std::sync::MutexGuard<'static, ()> {
     static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1381,10 +1399,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         }
         return Some(fresh());
     }
-    // Renderer port #6: view memory, which the kernel would refuse, and the
-    // caller does not ask the guards (textures, which then guard by a way of
-    // their own): no kernel call, ~300 a frame (run guard-2).
-    if !guarded && refused_as_view(start, end) {
+    // Keep the direct-query shortcut under renderer port #6. The default view
+    // cache can skip batched queries, but a direct unguarded query has no
+    // guard fallback if the address was reused for a private allocation.
+    if !guarded && port_guard() && refused_as_view(start, end) {
         return None;
     }
     // Asked, and the answer noted, with the range held: nothing else asks
@@ -1403,7 +1421,14 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     let refused = protected || viewed;
     let pages = match if refused { None } else { kernel_written(first, last) } {
-        Some(pages) => pages,
+        Some(pages) => {
+            if !guarded {
+                // The kernel recognised write-watch, so later batch queries
+                // must not skip the range because of a previous view.
+                forget_views(first, last);
+            }
+            pages
+        }
         None => {
             guards_asked = true;
             if !guarded {
@@ -1750,10 +1775,37 @@ pub(crate) fn port_guard_line(frames: f64) {
 /// find it no view ([`is_view`]) and say the range is not watched.
 static VIEWS: Bits = Bits::new();
 
+/// Blocks reserved as placeholders by `victory-hle::modules::xmem`.
+/// Under Wine/Proton `NtQueryVirtualMemory(MemoryRegionInformationEx = 7)`
+/// is unimplemented, so tracking placeholder reservations directly lets
+/// `known_holes()` work without ~13,700 `VirtualQuery` syscalls per frame.
+static PLACEHOLDERS: Bits = Bits::new();
+
+/// The runtime reserved placeholder memory at `[at, at + len)`.
+pub fn title_memory_placeholder(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    for block in first..last {
+        PLACEHOLDERS.set(block);
+    }
+}
+
+fn forget_placeholders(first: usize, last: usize) {
+    if !PLACEHOLDERS.any(first, last) {
+        return;
+    }
+    let set: Vec<usize> = PLACEHOLDERS.set_in(first, last).collect();
+    for block in set {
+        PLACEHOLDERS.clear(block);
+    }
+}
+
 /// Whether a block of `[first, last)` is known view memory and the kernel
 /// need not be asked ([`VIEWS`]).
 fn known_views(first: usize, last: usize) -> bool {
-    port_guard() && light() && VIEWS.any(first, last)
+    skip_view_ask() && light() && VIEWS.any(first, last)
 }
 
 /// A bit per block of the address space, in pieces made when first needed
@@ -2141,6 +2193,9 @@ fn known_holes() -> bool {
 /// to be only by mapping a view (or an allocation) in its place, which an
 /// ordinary commit cannot do.
 fn placeholder(block: usize) -> bool {
+    if PLACEHOLDERS.any(block, block + 1) {
+        return true;
+    }
     /// `MEMORY_REGION_INFORMATION` (ntddk).
     #[repr(C)]
     #[derive(Default)]
@@ -2185,7 +2240,11 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
-    if len == 0 || !known_holes() {
+    if len == 0 {
+        return;
+    }
+    forget_placeholders(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    if !known_holes() {
         return;
     }
     let g = guards();
@@ -2869,11 +2928,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
     }
     let rest = rest();
+    if skip_view_ask() && !VIEWS.all(first, last) {
+        (first..last).for_each(|block| VIEWS.set(block));
+    }
     if port_guard() {
-        // (Renderer port #6: known for a view from now on.)
-        if !VIEWS.all(first, last) {
-            (first..last).for_each(|block| VIEWS.set(block));
-        }
         return Some(guard_shared(first, last, &came, rest));
     }
     let mut g = guards_timed();
@@ -3787,11 +3845,14 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
-    if len != 0 {
-        forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    } else if VIEWS.any(at / BLOCK, at / BLOCK + 1) {
-        forget_views(at / BLOCK, allocation_end(at, at).div_ceil(BLOCK).max(at / BLOCK + 1));
-    }
+    let first = at / BLOCK;
+    let freed_end = if len != 0 {
+        at.saturating_add(len).div_ceil(BLOCK)
+    } else {
+        allocation_end(at, at).div_ceil(BLOCK).max(first + 1)
+    };
+    forget_views(first, freed_end);
+    forget_placeholders(first, freed_end);
     let mut g = guards();
     let first = at / BLOCK;
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
@@ -4218,6 +4279,7 @@ mod tests {
     /// lands and the block counts as written.
     #[test]
     fn kernel_reads_into_guarded_blocks_after_opening() {
+        let _one = one_asking_test();
         use std::io::{Read, Seek, Write};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
@@ -4332,6 +4394,7 @@ mod tests {
     /// read itself leaves it open: the read lands, and is seen.
     #[test]
     fn a_refresh_leaves_open_what_the_kernel_is_writing() {
+        let _one = one_asking_test();
         use std::io::{Read, Seek, Write};
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
         // SAFETY: a pagefile section of two blocks, mapped read-write.
@@ -4423,6 +4486,7 @@ mod tests {
     /// begun to unmap: no note of it stays behind.
     #[test]
     fn nothing_is_guarded_between_our_forgetting_it_and_its_unmapping() {
+        let _one = crate::watch::one_asking_test();
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
         // SAFETY: a pagefile section of a block, mapped read-write.
         let view = unsafe {
@@ -4452,6 +4516,7 @@ mod tests {
     /// taken for them: code stays code, private memory is not guarded.
     #[test]
     fn other_memory_at_a_guarded_address_keeps_its_protection() {
+        let _one = one_asking_test();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MapViewOfFile3, PAGE_EXECUTE_READ,
             PAGE_EXECUTE_READWRITE, UnmapViewOfFile2,
@@ -4515,6 +4580,7 @@ mod tests {
     /// its length or the allocation.
     #[test]
     fn freed_memory_leaves_no_notes() {
+        let _one = one_asking_test();
         let p = placeholder(3);
         let noted = |block: usize| {
             let g = guards();
@@ -4678,6 +4744,7 @@ mod tests {
     /// title code.
     #[test]
     fn a_block_guarded_before_we_were_told_of_its_view_can_be_written() {
+        let _one = one_asking_test();
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
@@ -4720,6 +4787,7 @@ mod tests {
 
     #[test]
     fn writes_in_partly_committed_view_blocks_are_reported() {
+        let _one = one_asking_test();
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -4781,6 +4849,7 @@ mod tests {
     /// or mapped since.
     #[test]
     fn a_range_that_begins_in_an_unmapped_block_is_guarded() {
+        let _one = one_asking_test();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
             MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
@@ -4872,6 +4941,7 @@ mod tests {
     /// again (they cannot be guarded) until the runtime maps them.
     #[test]
     fn unmapped_blocks_are_reported_once_until_mapped() {
+        let _one = one_asking_test();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
             MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
@@ -5005,6 +5075,7 @@ mod tests {
     /// guarded view's next check reports the pages written.
     #[test]
     fn a_write_through_another_view_is_reported_at_the_guarded_one() {
+        let _one = one_asking_test();
         const SIZE: usize = 2 * BLOCK;
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
@@ -5024,6 +5095,7 @@ mod tests {
     /// guarded view checks its pages again (and guards the new view).
     #[test]
     fn a_view_mapped_beside_a_guarded_one_makes_it_check_again() {
+        let _one = one_asking_test();
         const SIZE: usize = 2 * BLOCK;
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
@@ -5040,6 +5112,7 @@ mod tests {
     /// (`writing`): the other views' next checks report the pages written.
     #[test]
     fn a_write_told_at_one_view_is_reported_at_the_others() {
+        let _one = one_asking_test();
         const SIZE: usize = 2 * BLOCK;
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
@@ -5062,6 +5135,7 @@ mod tests {
     /// keep the bytes from before the write.
     #[test]
     fn a_write_is_reported_at_every_checked_view() {
+        let _one = one_asking_test();
         const SIZE: usize = 2 * BLOCK;
         let (section, one, two) = two_views(SIZE);
         let pages = |view: usize, block: usize| (view + block * BLOCK) / PAGE;
@@ -5086,6 +5160,7 @@ mod tests {
     /// read-only, are told as written, and take writes of their own.
     #[test]
     fn a_write_opens_the_view_it_goes_through() {
+        let _one = one_asking_test();
         let (section, one, two) = two_views(BLOCK);
         let page = |view: usize| view / PAGE;
         for view in [one, two] {
@@ -5117,6 +5192,7 @@ mod tests {
     /// as written at each asking, at every view of it, until it has rested.
     #[test]
     fn a_block_just_written_rests() {
+        let _one = one_asking_test();
         let (section, one, two) = two_views(BLOCK);
         let page = one / PAGE;
         let rests = |rests: bool| REST_IN_TEST.set(std::time::Duration::from_secs(if rests { 3600 } else { 0 }));
@@ -5143,6 +5219,7 @@ mod tests {
     /// block stays read-only; until it has had its share.
     #[test]
     fn what_the_title_puts_in_beside_a_guard_is_told() {
+        let _one = one_asking_test();
         let (section, one, two) = two_views(BLOCK);
         crate::title_memory_section(section, BLOCK as u64, true);
         let page = |view: usize| view / PAGE;
@@ -5191,6 +5268,7 @@ mod tests {
     /// after, the block's guard and what the next asking says.
     #[test]
     fn stores_and_copies_of_the_title_leave_the_guard() {
+        let _one = one_asking_test();
         use std::sync::atomic::{AtomicU32, Ordering};
         unsafe extern "system-unwind" fn real(to: *mut u8, from: *const u8, n: usize) -> *mut u8 {
             // SAFETY: by the caller.
@@ -5260,6 +5338,32 @@ mod tests {
 
     /// Of a page taken before, what is taken again is the kernel's pages
     /// written since; where they are not known, all of it.
+    #[test]
+    fn direct_write_watch_query_handles_a_reused_view_address() {
+        if port_guard() {
+            return;
+        }
+        let _one = one_asking_test();
+        // SAFETY: a private, write-watched allocation owned by this test.
+        let at = unsafe {
+            VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(at, 0);
+        // Simulate a cached view at an address now occupied by private memory.
+        let block = at / BLOCK;
+        VIEWS.set(block);
+        // SAFETY: a byte in the committed test allocation.
+        unsafe { (at as *mut u8).write_volatile(1) };
+        let found = writes(at, at + PAGE, false);
+        let still_cached = VIEWS.any(block, block + 1);
+        forget_views(block, block + 1);
+        // SAFETY: release the allocation after clearing its cached view.
+        assert_ne!(unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) }, 0);
+        let (_, notes) = found.expect("a cached view cannot hide a private write-watch query");
+        assert!(!still_cached, "batch queries must see the new private allocation");
+        assert!(notes.iter().any(|&(page, _)| page == at / PAGE));
+    }
+
     #[test]
     fn what_is_taken_again_is_what_was_written() {
         // SAFETY: a fresh write-watched allocation, freed at the end.
@@ -5345,6 +5449,7 @@ mod tests {
     /// the write through one takes the bits of all.
     #[test]
     fn bits_go_at_every_view() {
+        let _one = crate::watch::one_asking_test();
         const SIZE: usize = 2 * BLOCK;
         let (section, one, two) = two_views(SIZE);
         let ask = |at: usize| writes(at, at + SIZE, true).expect("a view");
@@ -5366,6 +5471,7 @@ mod tests {
     /// is told as written at every asking, and the first is not guarded.
     #[test]
     fn what_the_kernel_writes_through_is_not_guarded_for_another_view() {
+        let _one = one_asking_test();
         let (section, one, two) = two_views(BLOCK);
         let page = one / PAGE;
         assert_eq!(guard(one, one + BLOCK), Some(vec![page]));
@@ -5391,6 +5497,7 @@ mod tests {
     /// wrote while a submission's one asking stands.
     #[test]
     fn what_is_put_in_beside_the_guards_is_told_at_every_view() {
+        let _one = crate::watch::one_asking_test();
         let (section, one, two) = two_views(BLOCK);
         writes(two, two + BLOCK, true).expect("a view");
         let (before, _) = writes(two, two + BLOCK, true).expect("a view");
@@ -5406,6 +5513,7 @@ mod tests {
     /// count as written wherever else they are shown.
     #[test]
     fn a_view_being_split_leaves_its_pages_unguarded_elsewhere() {
+        let _one = one_asking_test();
         const SIZE: usize = 3 * BLOCK;
         let (section, one, two) = two_views(SIZE);
         let pages: Vec<usize> = (0..3).map(|k| one / PAGE + k).collect();
@@ -5433,6 +5541,7 @@ mod tests {
     /// itself: the others stay writable, and nothing looks through them all.
     #[test]
     fn a_page_of_many_views_is_guarded_one_view_at_a_time() {
+        let _one = one_asking_test();
         let (section, one, two) = two_views(BLOCK);
         let filler = one + (1 << 45);
         for n in 0..MANY_VIEWS {
@@ -5602,6 +5711,7 @@ mod many_askers_tests {
     /// for one address only, `VICTORY_VIEW_GUARD=0`.)
     #[test]
     fn no_write_through_another_view_is_lost_between_askers() {
+        let _one = crate::watch::one_asking_test();
         writes_to_views_are_not_lost::<3>(0, 0);
     }
 
@@ -5769,6 +5879,7 @@ mod many_askers_tests {
     /// allocated there. A hole that is no placeholder's is asked about.
     #[test]
     fn holes_are_known_until_the_runtime_tells() {
+        let _one = crate::watch::one_asking_test();
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         const BLOCKS: usize = 8;
         // SAFETY (all): a placeholder and a section of our own, which stay.
@@ -5854,6 +5965,7 @@ mod many_askers_tests {
     /// whoever asks after it, and blocks are known by their bits meanwhile.
     #[test]
     fn no_mapping_is_lost_between_askers() {
+        let _one = crate::watch::one_asking_test();
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         const BLOCKS: usize = 12;
@@ -5945,6 +6057,7 @@ mod many_askers_tests {
     /// or forgets it.
     #[test]
     fn bits_go_with_the_guard() {
+        let _one = crate::watch::one_asking_test();
         // SAFETY: a view of a section of our own, which stays.
         let at = unsafe {
             let section =
@@ -6272,6 +6385,7 @@ mod rearm_tests {
     /// not, and that is counted, as is a fault that gave no address.
     #[test]
     fn a_page_that_cannot_be_guarded_again_is_counted() {
+        let _one = one_asking_test();
         // SAFETY: a fresh page of our own.
         let page = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
         assert_ne!(page, 0);

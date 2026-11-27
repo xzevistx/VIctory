@@ -130,6 +130,16 @@ pub use host::on_failure;
 #[cfg(windows)]
 pub use fpsbox::{Note as PanelNote, note as panel_note, set_upscaler as panel_upscaler, upscaled as panel_upscaled};
 
+/// The process is ending in an orderly way (the title exits, or its window
+/// was closed): the pictures the capture thread still has in its line
+/// (`VICTORY_CAPTURE`) are written before this returns, or three seconds
+/// have passed, which is logged. Does nothing without diagnostics.
+#[cfg(windows)]
+pub fn finish_captures() {
+    #[cfg(feature = "diagnostics")]
+    capture::finish();
+}
+
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -151,7 +161,7 @@ pub fn frames_begun() -> u64 {
 pub use inplace::{high_views, title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
-    title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written, use_lazy_mapper,
-    writing as kernel_will_write,
+    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_placeholder, title_memory_reading,
+    title_memory_remapped, title_memory_remapping, title_memory_splitting, title_memory_unmapping,
+    title_memory_written, use_lazy_mapper, writing as kernel_will_write,
 };

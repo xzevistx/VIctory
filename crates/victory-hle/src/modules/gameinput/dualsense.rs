@@ -1,9 +1,13 @@
-//! PlayStation 5 pads (DualSense, DualSense Edge) read straight from HID:
+//! DualSense, DualSense Edge and USB DualShock 4 pads read straight from HID:
 //! they are not XInput devices, so without a remapper (Steam Input,
 //! DS4Windows) XInput never lists them. Reports can be USB or Bluetooth. A scan
 //! thread looks for new pads every [`SCAN`]; each pad has a reader thread
 //! that keeps its latest state until the pad goes away. By default XInput
 //! has priority over HID, since a remapper can present the same pad twice.
+//! A USB DualSense read over HID takes the title's rumble over HID too
+//! ([`feedback`]), from a writer thread.
+
+mod feedback;
 
 use super::{
     A, B, DOWN, LEFT, LEFT_SHOULDER, LEFT_STICK, MENU, PadState, RIGHT, RIGHT_SHOULDER,
@@ -15,6 +19,15 @@ const SONY: u16 = 0x054C;
 /// DualSense, DualSense Edge.
 #[cfg(windows)]
 const PRODUCTS: [u16; 2] = [0x0CE6, 0x0DF2];
+#[cfg(windows)]
+const DUALSHOCK4_PRODUCTS: [u16; 2] = [0x05C4, 0x09CC];
+
+#[derive(Clone, Copy)]
+enum ReportKind {
+    DualSenseUsb,
+    DualSenseBluetooth,
+    DualShock4Usb,
+}
 
 /// The D-pad hat (low nibble of the first button byte): 0 up, clockwise in
 /// eighths, 8 and above centred.
@@ -49,16 +62,13 @@ const BUTTONS: [(usize, u8, u32); 11] = [
 ];
 
 /// The pad in one input report, `None` for a report of another kind.
-/// `bluetooth`: the pad is connected over Bluetooth, where the full report
-/// is 0x31 (one byte further in) and 0x01 is the short report the pad sends
-/// before it was asked for the full one.
-pub(super) fn parse(report: &[u8], bluetooth: bool) -> Option<PadState> {
+fn parse(report: &[u8], kind: ReportKind) -> Option<PadState> {
     // Offsets of the sticks (LX LY RX RY), the triggers (L2 R2) and the
     // three button bytes.
-    let (sticks, triggers, buttons) = match (report.first()?, bluetooth) {
-        (0x01, false) => (1, 5, 8),
-        (0x31, true) => (2, 6, 9),
-        (0x01, true) => (1, 8, 5),
+    let (sticks, triggers, buttons) = match (report.first()?, kind) {
+        (0x01, ReportKind::DualSenseUsb) => (1, 5, 8),
+        (0x31, ReportKind::DualSenseBluetooth) => (2, 6, 9),
+        (0x01, ReportKind::DualSenseBluetooth | ReportKind::DualShock4Usb) => (1, 8, 5),
         _ => return None,
     };
     if report.len() < sticks + 4 || report.len() < triggers + 2 || report.len() < buttons + 3 {
@@ -89,7 +99,7 @@ fn mac(pairing: &[u8]) -> Option<[u8; 6]> {
 }
 
 #[cfg(windows)]
-pub(super) use host::pads;
+pub(super) use host::{pads, set_motors};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Mode {
@@ -148,7 +158,7 @@ pub(super) fn slots(
 #[cfg(windows)]
 mod host {
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{LazyLock, Mutex, PoisonError};
+    use std::sync::{Arc, LazyLock, Mutex, PoisonError};
     use std::time::Duration;
 
     use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
@@ -166,14 +176,15 @@ mod host {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-        ReadFile,
+        ReadFile, WriteFile,
     };
     use windows_sys::Win32::System::IO::{
         CancelIoEx, GetOverlappedResult, GetOverlappedResultEx, OVERLAPPED,
     };
     use windows_sys::Win32::System::Threading::CreateEventW;
 
-    use super::{PRODUCTS, PadState, SONY, mac, parse};
+    use super::feedback::{self, Motors};
+    use super::{DUALSHOCK4_PRODUCTS, PRODUCTS, PadState, ReportKind, SONY, mac, parse};
 
     /// How often to look for newly connected pads.
     const SCAN: Duration = Duration::from_secs(2);
@@ -193,6 +204,22 @@ mod host {
         mac: Option<[u8; 6]>,
         /// `None` until the first report, and while the pad is silent.
         state: Option<PadState>,
+        /// Its rumble; `None` but for a USB DualSense.
+        out: Option<Arc<Output>>,
+    }
+
+    /// A USB DualSense's rumble. The writer thread holds `handle`'s lock
+    /// while it writes; the reader sets it to `None` before closing the
+    /// handle.
+    struct Output {
+        handle: Mutex<Option<usize>>,
+        /// The output report length the device asks for.
+        len: usize,
+        /// The firmware update version (feature report 0x20), 0 when unknown.
+        firmware: u16,
+        want: Mutex<Motors>,
+        /// `None` until the first report: the first wish is sent whatever it is.
+        sent: Mutex<Option<Motors>>,
     }
 
     /// The open pads, in the order they were found.
@@ -231,10 +258,12 @@ mod host {
     struct Reports {
         input: Vec<u8>,
         feature: Vec<u8>,
+        /// Output report length, 0 when the collection has none.
+        output: usize,
     }
 
     impl Reports {
-        fn for_device(handle: HANDLE) -> Option<Self> {
+        fn for_device(handle: HANDLE, kind: ReportKind) -> Option<Self> {
             let mut data = 0;
             // SAFETY: the device is open and the output is writable.
             if !unsafe { HidD_GetPreparsedData(handle, &mut data) } {
@@ -244,17 +273,43 @@ mod host {
             // SAFETY: `data` was obtained above and is released after its last use.
             let status = unsafe { HidP_GetCaps(data, &mut caps) };
             unsafe { HidD_FreePreparsedData(data) };
-            if status != HIDP_STATUS_SUCCESS
-                || caps.InputReportByteLength == 0
-                || caps.FeatureReportByteLength == 0
+            if status != HIDP_STATUS_SUCCESS {
+                return None;
+            }
+            Self::from_caps(&caps, kind)
+        }
+
+        fn from_caps(caps: &HIDP_CAPS, kind: ReportKind) -> Option<Self> {
+            let dualshock4 = matches!(kind, ReportKind::DualShock4Usb);
+            if caps.InputReportByteLength == 0
+                || dualshock4 && (caps.UsagePage != 1 || caps.Usage != 5)
+                || !dualshock4 && caps.FeatureReportByteLength == 0
             {
                 return None;
             }
             Some(Self {
                 input: vec![0; usize::from(caps.InputReportByteLength)],
                 feature: vec![0; usize::from(caps.FeatureReportByteLength)],
+                output: usize::from(caps.OutputReportByteLength),
             })
         }
+    }
+
+    #[test]
+    fn dualshock4_can_open_an_input_only_gamepad_collection() {
+        let mut caps = HIDP_CAPS {
+            UsagePage: 1,
+            Usage: 5,
+            InputReportByteLength: 64,
+            ..Default::default()
+        };
+        let reports = Reports::from_caps(&caps, ReportKind::DualShock4Usb).unwrap();
+        assert_eq!(reports.input.len(), 64);
+        assert!(reports.feature.is_empty());
+        assert!(Reports::from_caps(&caps, ReportKind::DualSenseUsb).is_none());
+
+        caps.Usage = 6;
+        assert!(Reports::from_caps(&caps, ReportKind::DualShock4Usb).is_none());
     }
 
     /// Feature report `id` into `buffer` (its first byte), `false` when the
@@ -304,23 +359,47 @@ mod host {
             {
                 continue;
             }
-            let Some((handle, mut reports)) = open(&path) else {
+            let bluetooth = lower.contains("{00001124-");
+            let Some((handle, mut reports, kind)) = open(&path, bluetooth) else {
                 continue;
             };
-            let bluetooth = lower.contains("{00001124-");
             // A paired pad that is switched off can still be listed over
             // Bluetooth: it does not answer.
-            if !full_reports(handle, &mut reports.feature) {
+            if !matches!(kind, ReportKind::DualShock4Usb)
+                && !full_reports(handle, &mut reports.feature)
+            {
                 tracing::debug!(path = %lower, "DualSense listed but not answering");
                 // SAFETY: just opened, nothing else has it.
                 unsafe { CloseHandle(handle) };
                 continue;
             }
-            let mac = if feature(handle, 0x09, &mut reports.feature) {
+            let mac = if !matches!(kind, ReportKind::DualShock4Usb)
+                && feature(handle, 0x09, &mut reports.feature)
+            {
                 mac(&reports.feature)
             } else {
                 None
             };
+            // Rumble for a USB DualSense whose output report is the one we
+            // know (at least 48 bytes).
+            let out = (matches!(kind, ReportKind::DualSenseUsb)
+                && (feedback::USB_OUTPUT_LEN..=128).contains(&reports.output))
+            .then(|| {
+                let firmware = if reports.feature.len() >= 64
+                    && feature(handle, feedback::FEATURE_FIRMWARE_ID, &mut reports.feature)
+                {
+                    feedback::firmware_version(&reports.feature).unwrap_or(0)
+                } else {
+                    0
+                };
+                Arc::new(Output {
+                    handle: Mutex::new(Some(handle as usize)),
+                    len: reports.output,
+                    firmware,
+                    want: Mutex::new(Motors::default()),
+                    sent: Mutex::new(None),
+                })
+            });
             static NEXT_ID: AtomicU64 = AtomicU64::new(0);
             let id = {
                 let mut pads = lock();
@@ -332,6 +411,7 @@ mod host {
                         path: path.clone(),
                         mac,
                         state: None,
+                        out: out.clone(),
                     });
                     id
                 })
@@ -348,22 +428,41 @@ mod host {
                 unsafe { CloseHandle(handle) };
                 continue;
             };
-            tracing::info!(path = %lower, bluetooth, "DualSense connected");
+            tracing::info!(
+                path = %lower,
+                bluetooth,
+                rumble = out.is_some(),
+                firmware = format_args!("{:#06x}", out.as_ref().map_or(0, |out| out.firmware)),
+                "PlayStation gamepad connected"
+            );
             let raw = handle as usize;
             if let Err(error) = std::thread::Builder::new()
-                .name("DualSense reader".into())
-                .spawn(move || read(raw as HANDLE, id, bluetooth, reports))
+                .name("PlayStation gamepad reader".into())
+                .spawn({
+                    let out = out.clone();
+                    move || read(raw as HANDLE, id, kind, reports, out)
+                })
             {
                 lock().retain(|pad| pad.id != id);
+                if let Some(out) = &out {
+                    *out.handle.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                }
                 // SAFETY: just opened, and no reader has it.
                 unsafe { CloseHandle(handle) };
-                tracing::warn!(%error, "could not start a DualSense reader");
+                tracing::warn!(%error, "could not start a PlayStation gamepad reader");
             }
         }
     }
 
     /// Reads reports until the pad goes away, then forgets it.
-    fn read(handle: HANDLE, id: u64, bluetooth: bool, mut reports: Reports) {
+    fn read(
+        handle: HANDLE,
+        id: u64,
+        kind: ReportKind,
+        mut reports: Reports,
+        out: Option<Arc<Output>>,
+    ) {
+        let bluetooth = matches!(kind, ReportKind::DualSenseBluetooth);
         let set = |state: Option<PadState>| {
             if let Some(pad) = lock().iter_mut().find(|pad| pad.id == id) {
                 pad.state = state;
@@ -411,7 +510,9 @@ mod host {
                 // Silent: whatever was held is not held any more, and the
                 // pad may be gone without the read failing.
                 set(None);
-                if !full_reports(handle, &mut reports.feature) {
+                if !matches!(kind, ReportKind::DualShock4Usb)
+                    && !full_reports(handle, &mut reports.feature)
+                {
                     // SAFETY: cancel the read and wait for it to end, so
                     // nothing writes into the input buffer once we return.
                     unsafe {
@@ -421,12 +522,16 @@ mod host {
                     break 'pad "not answering";
                 }
             }
-            if let Some(state) = parse(&reports.input[..got as usize], bluetooth) {
+            if let Some(state) = parse(&reports.input[..got as usize], kind) {
                 set(Some(state));
             }
         };
-        tracing::info!(why, bluetooth, "DualSense disconnected");
+        tracing::info!(why, bluetooth, "PlayStation gamepad disconnected");
         lock().retain(|pad| pad.id != id);
+        if let Some(out) = out {
+            // No write of the writer thread is under way or starts after this.
+            *out.handle.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
         // SAFETY: ours, and nothing uses them any more.
         unsafe {
             if !event.is_null() {
@@ -436,9 +541,135 @@ mod host {
         }
     }
 
+    /// Asks the HID pad `id` for these motor speeds (heavy, light; 0 to
+    /// 65535, as XInput has them); only a USB DualSense takes them.
+    pub(in super::super) fn set_motors(id: u64, heavy: u16, light: u16) {
+        static WRITER: LazyLock<()> = LazyLock::new(|| {
+            if let Err(error) = std::thread::Builder::new()
+                .name("PlayStation gamepad writer".into())
+                .spawn(writer)
+            {
+                tracing::warn!(%error, "could not start the PlayStation gamepad writer");
+            }
+        });
+        if !feedback::rumble_on() {
+            return;
+        }
+        let Some(out) = lock()
+            .iter()
+            .find(|pad| pad.id == id)
+            .and_then(|pad| pad.out.clone())
+        else {
+            return;
+        };
+        let byte = |speed: u16| (speed >> 8) as u8;
+        *out.want.lock().unwrap_or_else(PoisonError::into_inner) = Motors {
+            heavy: byte(heavy),
+            light: byte(light),
+        };
+        LazyLock::force(&WRITER);
+    }
+
+    /// Reports at most this often per pad: rumble levels change every frame.
+    const WRITE_EVERY: Duration = Duration::from_millis(10);
+    /// A write that takes longer is cancelled (a pad going away).
+    const WRITE_WAIT_MS: u32 = 100;
+
+    /// Sends each pad's motors when they differ from what it was last sent.
+    fn writer() {
+        // SAFETY: an unnamed manual-reset event; no security attributes.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            tracing::warn!("PlayStation gamepad writer: no event");
+            return;
+        }
+        // Say once that reports go out, and once if one does not.
+        let (mut told_sent, mut told_failed) = (false, false);
+        loop {
+            std::thread::sleep(WRITE_EVERY);
+            let outs: Vec<Arc<Output>> = lock().iter().filter_map(|pad| pad.out.clone()).collect();
+            for out in outs {
+                let want = *out.want.lock().unwrap_or_else(PoisonError::into_inner);
+                if *out.sent.lock().unwrap_or_else(PoisonError::into_inner) == Some(want) {
+                    continue;
+                }
+                let report = feedback::usb(want, out.firmware, out.len);
+                let handle = out.handle.lock().unwrap_or_else(PoisonError::into_inner);
+                let Some(raw) = *handle else {
+                    continue;
+                };
+                let done = write(raw as HANDLE, event, &report);
+                drop(handle);
+                match done {
+                    Ok(written) if feedback::whole(written, report.len()) => {
+                        *out.sent.lock().unwrap_or_else(PoisonError::into_inner) = Some(want);
+                        if !told_sent && want != Motors::default() {
+                            told_sent = true;
+                            tracing::info!(
+                                heavy = want.heavy,
+                                light = want.light,
+                                bytes = report.len(),
+                                written,
+                                "PlayStation gamepad: first rumble report sent"
+                            );
+                        }
+                    }
+                    done if !told_failed => {
+                        told_failed = true;
+                        tracing::warn!(
+                            ?done,
+                            bytes = report.len(),
+                            "PlayStation gamepad: a rumble report was not written whole"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// One output report, waited for at most [`WRITE_WAIT_MS`]: the bytes
+    /// written as the driver counts them, or the error.
+    fn write(handle: HANDLE, event: HANDLE, report: &[u8]) -> Result<u32, u32> {
+        // SAFETY: plain data; only the event is set.
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        overlapped.hEvent = event;
+        let mut got = 0;
+        // SAFETY: `report` and `overlapped` outlive the write: every way out
+        // below waits for it to end first.
+        let started = unsafe {
+            WriteFile(
+                handle,
+                report.as_ptr(),
+                report.len() as u32,
+                std::ptr::null_mut(),
+                &mut overlapped,
+            )
+        };
+        if started == 0 {
+            // SAFETY: plain query.
+            let error = unsafe { GetLastError() };
+            if error != ERROR_IO_PENDING {
+                return Err(error);
+            }
+        }
+        // SAFETY: the write started above.
+        if unsafe { GetOverlappedResultEx(handle, &overlapped, &mut got, WRITE_WAIT_MS, 0) } != 0 {
+            return Ok(got);
+        }
+        // SAFETY: plain query.
+        let error = unsafe { GetLastError() };
+        // SAFETY: cancel and wait for the write to end before `report` goes.
+        unsafe {
+            CancelIoEx(handle, &overlapped);
+            GetOverlappedResult(handle, &overlapped, &mut got, 1);
+        }
+        Err(error)
+    }
+
     /// The pad at `path` opened for reading, `None` when it is something else
     /// or cannot be opened.
-    fn open(path: &[u16]) -> Option<(HANDLE, Reports)> {
+    fn open(path: &[u16], bluetooth: bool) -> Option<(HANDLE, Reports, ReportKind)> {
         let mut name = path.to_vec();
         name.push(0);
         // SAFETY: a terminated path; no security attributes or template.
@@ -461,11 +692,22 @@ mod host {
             ..Default::default()
         };
         // SAFETY: an open device and room for its attributes.
-        let ours = unsafe { HidD_GetAttributes(handle, &mut attributes) }
-            && attributes.VendorID == SONY
-            && PRODUCTS.contains(&attributes.ProductID);
-        if ours && let Some(reports) = Reports::for_device(handle) {
-            return Some((handle, reports));
+        if unsafe { HidD_GetAttributes(handle, &mut attributes) } && attributes.VendorID == SONY {
+            let kind = match (attributes.ProductID, bluetooth) {
+                (product, false) if DUALSHOCK4_PRODUCTS.contains(&product) => {
+                    Some(ReportKind::DualShock4Usb)
+                }
+                (product, false) if PRODUCTS.contains(&product) => Some(ReportKind::DualSenseUsb),
+                (product, true) if PRODUCTS.contains(&product) => {
+                    Some(ReportKind::DualSenseBluetooth)
+                }
+                _ => None,
+            };
+            if let Some(kind) = kind
+                && let Some(reports) = Reports::for_device(handle, kind)
+            {
+                return Some((handle, reports, kind));
+            }
         }
         // SAFETY: just opened.
         unsafe { CloseHandle(handle) };
@@ -629,7 +871,7 @@ mod tests {
         report[5] = 255; // L2
         report[8] = 0x20 | 2; // cross, D-pad right
         report[9] = 0x20 | 0x01; // options, L1
-        let pad = parse(&report, false).unwrap();
+        let pad = parse(&report, ReportKind::DualSenseUsb).unwrap();
         assert_eq!(pad.buttons, A | RIGHT | MENU | LEFT_SHOULDER);
         assert_eq!(
             (pad.left_x, pad.left_y, pad.left_trigger),
@@ -645,14 +887,14 @@ mod tests {
         report[2..6].copy_from_slice(&[128, 0, 255, 128]); // left up, right right
         report[7] = 255; // R2
         report[9] = 0x80 | 8; // triangle, D-pad centred
-        let pad = parse(&report, true).unwrap();
+        let pad = parse(&report, ReportKind::DualSenseBluetooth).unwrap();
         assert_eq!(pad.buttons, Y);
         assert_eq!(
             (pad.left_y, pad.right_x, pad.right_trigger),
             (1.0, 1.0, 1.0)
         );
         // the same bytes over USB are not a pad report
-        assert_eq!(parse(&report, false), None);
+        assert_eq!(parse(&report, ReportKind::DualSenseUsb), None);
     }
 
     #[test]
@@ -663,8 +905,23 @@ mod tests {
         report[5] = 0x40 | 4; // circle, D-pad down
         report[7] = 0x02; // touchpad click
         report[8] = 128; // L2 halfway
-        let pad = parse(&report, true).unwrap();
+        let pad = parse(&report, ReportKind::DualSenseBluetooth).unwrap();
         assert_eq!(pad.buttons, B | DOWN | VIEW);
         assert!((pad.left_trigger - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn dualshock4_usb_reads_sticks_buttons_and_triggers() {
+        let mut report = [0u8; 64];
+        report[..10].copy_from_slice(&[1, 0, 255, 255, 0, 0x21, 0x20, 0x02, 255, 128]);
+        let pad = parse(&report, ReportKind::DualShock4Usb).unwrap();
+        assert_eq!(pad.buttons, A | UP | RIGHT | MENU | VIEW);
+        assert_eq!(
+            (pad.left_x, pad.left_y, pad.right_x, pad.right_y),
+            (-1.0, -1.0, 1.0, 1.0)
+        );
+        assert_eq!(pad.left_trigger, 1.0);
+        assert!((pad.right_trigger - 0.5).abs() < 0.01);
+        assert_eq!(parse(&report[..9], ReportKind::DualShock4Usb), None);
     }
 }

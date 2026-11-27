@@ -49,6 +49,10 @@ impl FileScan {
         })
     }
 
+    pub(crate) fn had_io_errors(&self) -> bool {
+        self.walk_errors + self.metadata_errors + self.read_errors != 0
+    }
+
     fn read_file(&mut self, path: &Path, metadata: io::Result<fs::Metadata>) -> Option<Vec<u8>> {
         let size = match metadata {
             Ok(metadata) => metadata.len(),

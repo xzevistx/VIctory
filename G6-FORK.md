@@ -1,10 +1,10 @@
-# G6 fork of VIctory (branch `g6-vt2`)
+# G6 fork of VIctory (branch `g6-vt3`)
 
-This branch runs **G6** (the Xbox Series X build of the open-world title) through VIctory on Windows PCs with NVIDIA cards. It is upstream [TaynanGT/Vice-Tay](https://github.com/TaynanGT/Vice-Tay) `main` at `e939566` plus the G6 work described here. The goal is a **stable 30 FPS with 30 FPS 1% lows**. On an RTX 4070 SUPER / Ryzen 9 5950X today:
+This branch runs **G6** (the Xbox Series X build of the open-world title) through VIctory on Windows PCs with NVIDIA cards. It is upstream [TaynanGT/Vice-Tay](https://github.com/TaynanGT/Vice-Tay) `main` at `aa917f3` merged into the G6 work described here (`g6-vt2` is the older branch, upstream `e939566`). The goal is a **stable 30 FPS with 30 FPS 1% lows**. On an RTX 4070 SUPER / Ryzen 9 5950X today:
 
 | Setup | FPS | 1% low |
 |---|---|---|
-| **Series S profile + DLSS quality (recommended)** | **16–17** (20–26 in later cutscenes) | ~2–3 |
+| **Series S profile + DLSS quality (recommended)** | **17–18** (20–26 in later cutscenes) | ~3–3.7 |
 | Series X, no DLSS | ~13 | ~2 |
 | Series X + DLSS 4K performance / ultra-performance | 12.4 / 13.7 | 2.3 / 1.3 |
 
@@ -93,10 +93,19 @@ Measured on the same scenes from one saved game, Series S + DLSS, rays off:
 | Fault | Cause | Fix (default) | Turn it off |
 |---|---|---|---|
 | Black (and white) squares lying on the water: sea, pools, the shore | the translator's fallback for the water programs' 64-lane wave code (`VICTORY_WAVE_NATIVE=0`, set by the tested switch set since an old FPS suspicion) | `run-g6.ps1` sets `VICTORY_WAVE_NATIVE=1`: those programs run as plain 32-lane waves (`emit/mod.rs` `emit()`, `lower::wave_local`). Runs fix-t8 (blocks) against fix-t9 (clean), same shots, 18.1 vs 18.4 FPS. (`VICTORY_INDIRECT_WINDOW/BATCH` were first blamed; they are left out of `run-g6.ps1` too, no slower.) | `-Extra 'VICTORY_WAVE_NATIVE=0'` |
-| Purple / magenta glow | with rays off, the screen probes' memory holds garbage that comes out magenta | the stand-in lighting is on unless `VICTORY_AMBIENT` is set: 0.8 of the estimate, air bounded at 2x, reflections held at 2x on `CombinedReflections` (`ambient.rs` `G6_*`); magenta pixels 0.53% → 0.04–0.2% | `VICTORY_AMBIENT=0` |
+| Purple / magenta glow | with rays off, the screen probes' memory holds garbage that comes out magenta | the stand-in lighting is on unless `VICTORY_AMBIENT` is set: 0.8 of the estimate, air bounded at 2x, reflections held on the temporal reflection resolves (`ambient.rs` `G6_*`); magenta pixels 0.53% → 0.04–0.2% | `VICTORY_AMBIENT=0` |
 | Old blocks of skin and clothes staying on characters | textures picked by index were checked 5 times (3 small samples) and then never again; G6 fills large textures later | checked every 400 frames for good, 8 samples spread over large textures (`draw.rs` `recheck_long`, `texture.rs` `fingerprint`) | `VICTORY_HEAP_RECHECK_LONG=0` |
 
-Still open: whiteout when the camera goes underwater and in the sunset rooftop chase (probe and air light with rays off); purple-red foliage with rays off (green with the title's rays; the magenta rules in `ambient.rs` reduce it).
+Fixed by the upstream merge (`g6-vt3`):
+
+| Fault | Cause | Fix (default) | Turn it off |
+|---|---|---|---|
+| Purple-red foliage with rays off | most likely upstream `fa8fc1d`: the ambient resolve now gets a depth view that matches its plane | merged | none |
+| Every loading screen rebuilt ~418 pipelines (first minutes at 4.6 FPS) | upstream `fa8fc1d` keeps NVIDIA pipelines with static samplers out of the pipeline library (stale sampler indices after a restart were its worry) | `run-g6.ps1` sets upstream's own `VICTORY_LIBRARY_STATIC_SAMPLERS=1`: 0 rebuilt, 17.2–18.2 FPS, no filtering errors seen in the test shots | `-Extra 'VICTORY_LIBRARY_STATIC_SAMPLERS=0'` |
+
+The stand-in's reflection hold now uses upstream's documented selectors (`CS_TemporalResolve2_Opaque,CS_TemporalResolve1_Alpha`, from TaynanGT/Vice-Tay `docs/fork-ray-tracing.md`); the guessed `CombinedReflections` never matched. `VICTORY_SKIP_NAMED=<text>[,<text>]` leaves out compute programs by name, for tests.
+
+Still open: whiteout when the camera goes underwater and in the sunset rooftop chase (probe and air light with rays off); low-detail, untextured background characters in some runs (streaming arriving late; seen in one run of three on the same save); speckled light on shaded rock in a few shots.
 
 ## Ray tracing (why outdoor scenes glow white)
 
@@ -110,7 +119,7 @@ G6 traces its own rays: its `XboxBvhBuilder.dll` builds the structures and compu
 
 1. Lazy page mappings break geometry: `xmem.rs` `map_alias_lazy` / `lazy_source`, `host.rs` `read` / `write_mapped`.
 2. A magenta stripe in the kitchen shot of the intro; its source pass is unknown. Capture intermediate render targets on that frame.
-3. Pipelines still build mid-run on a warm cache (panel `SHADERS BUILDING`).
+3. A few pipelines still build mid-run on a warm cache (panel `SHADERS BUILDING`; about 90 on a third run).
 4. VRAM spill: ~8.6 GB in PC memory in the intro. Try `VICTORY_TEXTURE_BUDGET_MB`.
 5. Per-frame copies: COPY + BACK about 50 ms a frame. `VICTORY_BACK_BY_COPY=1` lists copy-back per buffer; `VICTORY_BACK_SKIP=<addr>` skips one.
 6. Two water compute programs have no 32-lane form: `6871d6e4b3ac9a10`, `a10179ab7eda0dc3`.
@@ -119,7 +128,7 @@ G6 traces its own rays: its `XboxBvhBuilder.dll` builds the structures and compu
 
 Give your agent this file first. Rules this branch follows:
 
-- **Branch from `g6-vt2`** and open a pull request against it. One change per pull request, with:
+- **Branch from `g6-vt3`** and open a pull request against it. One change per pull request, with:
   - the switch that turns it on or off;
   - before/after numbers from the same build otherwise, the same scene and the same switches;
   - a picture of the same shot before and after.

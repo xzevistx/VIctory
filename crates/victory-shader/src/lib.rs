@@ -26,7 +26,7 @@ pub mod structure;
 /// translated before is kept across the rebuild. `victory shaders`
 /// translates again what an earlier build of the translator cached and says
 /// how many came out different: if any did, the bump was due.
-pub const TRANSLATOR_VERSION: u32 = 8; // 8 (g6-vt2): upstream's 7, plus tiled-lighting light lists read as integers and the wave64 allocation idiom as local 32-lane waves first
+pub const TRANSLATOR_VERSION: u32 = 16; // 16 (g6-vt3): upstream's 15, plus g6's tiled-lighting light lists read as integers and the wave64 allocation idiom as local 32-lane waves first
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};

@@ -34,6 +34,11 @@ $s = [ordered]@{
     # (runs fix-t8 against fix-t9, same shots; 18.1 vs 18.4 FPS).
     VICTORY_WAVE_NATIVE = '1'; VICTORY_LAZY_ALIAS = '0'; VICTORY_HIGH_VIEWS = '0'; VICTORY_UPLOAD_SLOTS_TOP_DOWN = '0'
     VICTORY_CARD_BUFFERS_FIRST = '0'; VICTORY_MAP_THREADS = '1'; VICTORY_PIPELINE_WAIT_MS = '500'
+    # g6-vt3: upstream fa8fc1d keeps NVIDIA pipelines with static samplers out of the
+    # pipeline library, so ~418 rebuilt in every loading screen (4.6 FPS for the first
+    # 160 s). Its own switch puts them back: 0 rebuilt, 17.1 FPS (run vt3-lib2), no
+    # filtering errors seen.
+    VICTORY_LIBRARY_STATIC_SAMPLERS = '1'
 }
 foreach ($k in $s.Keys) { Set-Item "Env:$k" $s[$k] }
 foreach ($pair in ($Extra -split ';' | Where-Object { $_ })) {
