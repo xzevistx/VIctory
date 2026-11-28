@@ -1262,6 +1262,36 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
+/// The runtime made `[at, at + len)` show other physical pages without
+/// mapping them there (a lazy GPU page-mapping copy, `VICTORY_LAZY_ALIAS=1`):
+/// its bytes are new, but no write happened at these addresses, which are
+/// never mapped, so neither the kernel's write watch nor a guard can tell a
+/// copy over them so. Its pages are noted written now, as a write would be,
+/// and are known by their bits no longer: the next refresh of every copy over
+/// them reads them again (through a view of the same physical pages). Without
+/// it the prison room's walls and ceiling of the world's first scene kept
+/// the empty bytes their copies held before the pages streamed in (G6 and
+/// cool_fox alike). `VICTORY_LAZY_NOTE=0`: not noted, as before.
+pub fn title_memory_shown_anew(at: usize, len: usize) {
+    if len == 0 || !crate::toggled!("VICTORY_LAZY_NOTE") {
+        return;
+    }
+    let end = at.saturating_add(len);
+    for block in at / BLOCK..end.div_ceil(BLOCK) {
+        PUBLISHED.clear(block);
+    }
+    let mut j = journal_mut();
+    let now = next_asking();
+    // (As `wrote`: what is copied from now on counts as copied after this,
+    // or every refresh of a standing asking would copy the pages again.)
+    if j.kept {
+        j.ahead_asked = now;
+    }
+    for page in at / PAGE..end.div_ceil(PAGE) {
+        j.notes.note(page, WHOLE, now);
+    }
+}
+
 /// Bound the extra kernel probe for a raw copy to 256 KiB.
 pub(crate) const RAW_COPY_WATCH_LIMIT: usize = 256 << 10;
 
@@ -3167,9 +3197,14 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// have now; a view whose block's claim cannot be had is not covered.
 fn cover(g: &Guards, from: usize, to: usize, mut claims: Option<&mut Claims>) -> bool {
     let mut all = true;
+    let lazy = lazy_watch();
     for (page, others) in elsewhere(from * BLOCK, (to - from) * BLOCK) {
         let block = page / BLOCK;
         if !g.protected.contains(block) {
+            // A lazy page ([`lazy_watch`]): its other views are guarded for it.
+            if lazy && g.absent.contains(block) && !cover_lazy(g, block, &others, claims.as_deref_mut()) {
+                all = false;
+            }
             continue; // not there, or not ours to guard
         }
         #[cfg(feature = "diagnostics")]
@@ -3177,6 +3212,11 @@ fn cover(g: &Guards, from: usize, to: usize, mut claims: Option<&mut Claims>) ->
         g.aliased.insert(block);
         let mut covered = true;
         for other in others {
+            // (A lazy page beside it: nothing writes through it, nor could it
+            // be made read-only. Left in, this block was never clean.)
+            if lazy && g.absent.contains(other / BLOCK) {
+                continue;
+            }
             covered &= protect_alias(g, other / BLOCK, claims.as_deref_mut());
         }
         if !covered {
@@ -3185,6 +3225,49 @@ fn cover(g: &Guards, from: usize, to: usize, mut claims: Option<&mut Claims>) ->
         }
     }
     all
+}
+
+/// Whether a lazy page of a GPU page-mapping copy (`VICTORY_LAZY_ALIAS=1`) is
+/// watched by way of the other views of its physical page
+/// (`VICTORY_LAZY_WATCH=0`: not, as before).
+///
+/// Nothing is mapped at a lazy page (a placeholder), so it cannot be made
+/// read-only: [`guard`] notes its block absent, and tells an absent block as
+/// never written. The title writes the same physical page through its own
+/// view, and the copies over the lazy address kept the bytes they had: the
+/// character's body in the world's first scene was gone, head and hair left
+/// (run L3-lazy-note), with lazy mappings on and the walls already right
+/// ([`title_memory_shown_anew`]). With this, [`cover_lazy`] makes the page's
+/// other views read-only for the lazy block, as [`cover`] does for a guarded
+/// one, and a write that opens one of them ([`open_given`]) takes the lazy
+/// block out of the absent ones: it is told as written at the next asking,
+/// and covered again then.
+fn lazy_watch() -> bool {
+    lazy_on() && crate::toggled!("VICTORY_LAZY_WATCH")
+}
+
+/// [`cover`] for `block`, a lazy page ([`lazy_watch`]) that the title shows
+/// at `others` too: those are made read-only, and a write through one of them
+/// opens it and tells `block` written. Where one cannot be (it rests after a
+/// write, or the kernel writes it now), `block` is absent no longer: told as
+/// written at every asking until it can. Other lazy pages of the page are
+/// left out: nothing writes through them. Whether all are covered.
+fn cover_lazy(g: &Guards, block: usize, others: &[usize], mut claims: Option<&mut Claims>) -> bool {
+    g.aliased.insert(block);
+    let mut covered = true;
+    for &other in others {
+        let other = other / BLOCK;
+        if g.absent.contains(other) {
+            continue;
+        }
+        covered &= protect_alias(g, other, claims.as_deref_mut());
+    }
+    if !covered {
+        g.absent.remove(block);
+        g.held.remove(block);
+        PUBLISHED.clear(block);
+    }
+    covered
 }
 
 /// Makes `block` read-only: another view of a page a copy is about to take
@@ -3346,6 +3429,7 @@ fn open_given(g: &Guards, start: usize, end: usize, given: Option<&[usize]>) -> 
     let aliased: Vec<usize> = g.aliased.range(first..last).collect();
     if !aliased.is_empty() {
         let one = open_one_view();
+        let lazy = lazy_watch();
         for block in aliased {
             g.aliased.remove(block);
             let others: Vec<usize> = match given {
@@ -3353,6 +3437,12 @@ fn open_given(g: &Guards, start: usize, end: usize, given: Option<&[usize]>) -> 
                 None => crate::inplace::pages_of(block * BLOCK).into_iter().map(|p| p / BLOCK).collect(),
             };
             for other in others {
+                // A lazy page of the same physical page ([`lazy_watch`]): told
+                // as written at its next asking.
+                if lazy && g.absent.remove(other) {
+                    g.held.remove(other);
+                    PUBLISHED.clear(other);
+                }
                 if one {
                     // Before the first can be written.
                     g.clean.remove(other);
@@ -3420,6 +3510,15 @@ pub fn writing(at: usize, len: usize) {
             crate::faultbook::note(crate::faultbook::What::Ours, at / BLOCK, last, opened as u64);
         }
         let _ = opened;
+    }
+    // A lazy page under it ([`lazy_watch`]): nothing is mapped there to be
+    // opened, and it was told as never written. DirectStorage's streams into
+    // the page's physical memory come here for every address that shows it
+    // (`xmem::pages_written`), once more when the bytes are in: told as
+    // written at its next asking, the copies over it (a face's texture) read
+    // them. `VICTORY_LAZY_STREAM=0`: not, as before.
+    if len != 0 && lazy_watch() && crate::toggled!("VICTORY_LAZY_STREAM") {
+        lazy_shown_anew(&[(at, len)]);
     }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
@@ -3554,6 +3653,13 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
         return;
     }
     let ranges = crate::inplace::views_of_section(section, offset, len);
+    // Lazy pages of these physical pages ([`lazy_watch`]) were told as never
+    // written, their other views guarded for them: this view may be written
+    // unguarded now. Told as written at their next asking, which guards this
+    // one with the others.
+    if lazy_watch() {
+        lazy_shown_anew(&ranges);
+    }
     // (A block is noted in `PROTECTED` ahead of the look at its page's views
     // that did not find this one yet.)
     if !ranges.iter().any(|&(at, n)| PROTECTED.any(at / BLOCK, (at + n).div_ceil(BLOCK))) {
@@ -3569,6 +3675,24 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     #[cfg(feature = "diagnostics")]
     ALIASES[2].fetch_add(blocks.len() as u64, std::sync::atomic::Ordering::Relaxed);
     unguard(&g, &blocks);
+}
+
+/// The lazy pages ([`lazy_watch`]) among the views `ranges` (address, bytes)
+/// are absent no longer: told as written at their next asking.
+fn lazy_shown_anew(ranges: &[(usize, usize)]) {
+    let absent = |g: &Guards| -> Vec<usize> {
+        ranges.iter().flat_map(|&(at, n)| g.absent.range(at / BLOCK..(at + n).div_ceil(BLOCK)).collect::<Vec<_>>()).collect()
+    };
+    // (A look first, the lock shared: most views have no lazy page.)
+    if absent(&guards_shared()).is_empty() {
+        return;
+    }
+    let g = guards();
+    for block in absent(&g) {
+        g.absent.remove(block);
+        g.held.remove(block);
+        PUBLISHED.clear(block);
+    }
 }
 
 /// The runtime is about to unmap a view of which it maps a part again at

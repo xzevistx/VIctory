@@ -9872,6 +9872,15 @@ static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::A
 #[cfg(feature = "diagnostics")]
 static FLUSHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Inside [`Batch::refresh_spans`], since the last frame-rate line: on the
+/// threads beside (summed), nanoseconds of "nothing new" checks, those that
+/// found nothing new, those that found something; nanoseconds of updates,
+/// and how many; nanoseconds of texture refreshes; the fan-outs' wall
+/// nanoseconds and how many; and in front on this thread, the checks'
+/// nanoseconds and how many (flushes of few spans).
+#[cfg(feature = "diagnostics")]
+static REFRESH_PARTS: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
 /// The list step that needs to see pending refreshes completed.
 enum TitleWrite {
     Copy,
@@ -9946,6 +9955,25 @@ fn split_line(frames: f64) {
         e[0],
         e[1] / 1e3,
     );
+    {
+        let r: Vec<f64> = REFRESH_PARTS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "refresh flushes per frame, inside: {:.1} fan-outs taking {:.2} ms (wall); beside, all threads: {:.2} ms in {:.0} \
+             nothing-new checks ({:.0} nothing new, {:.0} something), {:.2} ms in {:.0} updates, {:.2} ms texture refreshes; \
+             in front: {:.2} ms in {:.0} checks",
+            r[7],
+            r[6] / 1e6,
+            r[0] / 1e6,
+            r[1] + r[2],
+            r[1],
+            r[2],
+            r[3] / 1e6,
+            r[4],
+            r[5] / 1e6,
+            r[8] / 1e6,
+            r[9],
+        );
+    }
     let writes = TITLE_WRITE_FLUSHES.each_ref().map(|[count, nanos]| {
         (count.swap(0, Ordering::Relaxed) as f64 / frames, nanos.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames)
     });
@@ -10643,9 +10671,15 @@ impl Batch {
             let _known = crate::timeline::span("refreshes in front: those known to copy nothing");
             #[cfg(feature = "diagnostics")]
             let all = spans.len();
+            #[cfg(feature = "diagnostics")]
+            let began = std::time::Instant::now();
             spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
             #[cfg(feature = "diagnostics")]
-            FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
+            {
+                FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
+                REFRESH_PARTS[8].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                REFRESH_PARTS[9].fetch_add(all as u64, Ordering::Relaxed);
+            }
         }
         let ahead = spans.len() > 1;
         if ahead {
@@ -10654,20 +10688,46 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let fanned = std::time::Instant::now();
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
+            #[cfg(feature = "diagnostics")]
+            let began = std::time::Instant::now();
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
                 due[i].refresh();
+                #[cfg(feature = "diagnostics")]
+                REFRESH_PARTS[5].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 return;
             };
             let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
+            if many {
+                let same = shadow.nothing_new(*from, *to - *from);
                 #[cfg(feature = "diagnostics")]
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                return;
+                {
+                    REFRESH_PARTS[0].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    REFRESH_PARTS[if same { 1 } else { 2 }].fetch_add(1, Ordering::Relaxed);
+                }
+                if same {
+                    #[cfg(feature = "diagnostics")]
+                    FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
             }
+            #[cfg(feature = "diagnostics")]
+            let updating = std::time::Instant::now();
             Self::update(shadow, *from, *to);
+            #[cfg(feature = "diagnostics")]
+            {
+                REFRESH_PARTS[3].fetch_add(updating.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                REFRESH_PARTS[4].fetch_add(1, Ordering::Relaxed);
+            }
         });
+        #[cfg(feature = "diagnostics")]
+        {
+            REFRESH_PARTS[6].fetch_add(fanned.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            REFRESH_PARTS[7].fetch_add(1, Ordering::Relaxed);
+        }
         if ahead {
             crate::watch::ask_ahead_done();
         }

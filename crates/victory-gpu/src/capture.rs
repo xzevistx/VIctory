@@ -224,7 +224,33 @@ pub(crate) fn requested(n: u64, listed: bool, framegen: bool) -> (bool, bool) {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(every);
-    (f8 || n.is_power_of_two() || listed || before_world || in_world, false)
+    let dense = world_on() && first != u64::MAX && n > first && dense().is_some_and(|(from, to, every)| {
+        (from..=to).contains(&(n - first)) && (n - first).is_multiple_of(every)
+    });
+    (f8 || n.is_power_of_two() || listed || before_world || in_world || dense, false)
+}
+
+/// `VICTORY_CAPTURE_WORLD_DENSE=<from>-<to>:<every>`: with
+/// `VICTORY_CAPTURE_WORLD`, also every `<every>`th frame from the `<from>`th
+/// to the `<to>`th after the world's first (the opening cutscene's faces and
+/// the phone's screen, which every 16th frame passed over).
+fn dense() -> Option<(u64, u64, u64)> {
+    static DENSE: std::sync::OnceLock<Option<(u64, u64, u64)>> = std::sync::OnceLock::new();
+    *DENSE.get_or_init(|| {
+        let v = std::env::var("VICTORY_CAPTURE_WORLD_DENSE").ok()?;
+        let (range, every) = v.trim().split_once(':')?;
+        let (from, to) = range.split_once('-')?;
+        let (from, to, every) = (from.trim().parse().ok()?, to.trim().parse().ok()?, every.trim().parse().ok()?);
+        (every > 0 && from <= to).then_some((from, to, every))
+    })
+}
+
+/// Whether frames saved on a schedule are saved whole (`VICTORY_CAPTURE_FULL=1`)
+/// and not at half size: faces and the phone's text at half size could not be
+/// judged.
+fn full() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_FULL").is_some_and(|v| v == "1"))
 }
 
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, sampling both axes at `step`.
@@ -590,9 +616,9 @@ pub(crate) fn save_read_back(
         } else if F8_FRAME.load(std::sync::atomic::Ordering::Relaxed) == frame {
             // g6-vt2: an F8 picture, apart from the frames saved on a schedule.
             tracing::info!(frame, "F8 picture saved");
-            (format!("frame-{frame}-f8"), 2)
+            (format!("frame-{frame}-f8"), if full() { 1 } else { 2 })
         } else {
-            (format!("frame-{frame}"), 2)
+            (format!("frame-{frame}"), if full() { 1 } else { 2 })
         };
         save_as(&name, f.Width, f.Height, pitch, bgra, rows, step);
         buffer.Unmap(0, None);

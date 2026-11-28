@@ -3177,10 +3177,18 @@ impl HostHeap {
             }
             let views = views.as_mut()?;
             if views.recording != recording {
+                #[cfg(feature = "diagnostics")]
+                {
+                    LISTED_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    LISTED_STATS[3].fetch_add(views.made.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
                 views.recording = recording;
                 views.made.clear();
             }
             let twins = self.twins.get(index as usize).is_some();
+            #[cfg(feature = "diagnostics")]
+            LISTED_STATS[if views.made.contains_key(&words) { 0 } else { 1 }]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if !views.made.contains_key(&words) {
                 let view = super::view_at(words[1], words[2])?;
                 let at = 2 * views.made.len() as u32;
@@ -3189,7 +3197,15 @@ impl HostHeap {
                     return None;
                 }
                 let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                #[cfg(feature = "diagnostics")]
+                let making = std::time::Instant::now();
+                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)));
+                #[cfg(feature = "diagnostics")]
+                {
+                    LISTED_STATS[4].fetch_add(making.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                    LISTED_STATS[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                let kept = kept?;
                 let stride_word = view_stride_word(&view);
                 let address = view_address(&view).unwrap_or(0);
                 let listed = Listed {
@@ -6873,6 +6889,16 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
         }
     });
 }
+
+/// Since the last frame line, of [`HostHeap::make_listed`]: views found made
+/// in this thread's cache, views made into it, the cache emptied for another
+/// recording, and the views it held when emptied. (Measured on a 6-core
+/// processor: ~15,000 made a frame, 60% of lookups; sharing them between a
+/// thread's recordings within a frame found only ~16% repeated, ran its slots
+/// out, and was slower: not kept.)
+#[cfg(feature = "diagnostics")]
+pub(crate) static LISTED_STATS: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// Whether a list makes a view its tables hold once (`VICTORY_LIST_VIEWS=0`:
 /// for every table).

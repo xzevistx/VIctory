@@ -61,7 +61,7 @@ You need your own legal dump of the title. No game files are in this repository.
 | UPLOAD SLOTS free/all OUT n NO ROOM n | the memory reserved at start for list uploads and memory by address; NO ROOM above 0 is trouble |
 | RAM FREE | the PC's free physical memory |
 | BUILD | build folder and exe hash |
-| N L B P | switches: wave native, lazy alias, buffers first, precompiled (1 on; the defaults show N1 L0 B0 P0) |
+| N L B P | switches: wave native, lazy alias, buffers first, precompiled (1 on; the defaults show N1 L1 B0 P0) |
 
 ## What this branch adds over upstream (where to look)
 
@@ -79,7 +79,11 @@ You need your own legal dump of the title. No game files are in this repository.
   - console rectangles (`pipeline/make.rs` `ready_rects`);
   - precompiled pipelines (`VICTORY_PRECOMPILED=1`);
   - a pipeline library per D3D12 runtime (`pipeline/library.rs`).
-- **Lazy page mappings** (`VICTORY_LAZY_ALIAS=1`, from cool_fox): removes the stall of the title's page-mapping copies. It raised 1% lows from ~1 to ~4, but **it currently loses some walls and character geometry**, so it is off in the tested set. Fixing that is the biggest open win.
+- **Lazy page mappings** (`VICTORY_LAZY_ALIAS=1`, from cool_fox, **on in the tested set**; `VICTORY_LAZY_ALIAS=0` turns it off): the title's GPU page-mapping copies get no view of their own; reads and writes of them go through views of the same physical pages (`xmem.rs` `map_alias_lazy` / `lazy_source`). It removes the stalls of those copies while the world streams in. Five-minute runs from a save, the camera moving, two runs each way: world 1% low 4.3–4.7 against 0.5–2.2, no frame over 360 ms against freezes of 1–11 s, median ~14.2 against ~12.0 FPS, the same CPU work a frame.
+  - It used to lose the prison room's walls and the character's body. Two fixes in `watch.rs` make it draw right:
+    - `title_memory_shown_anew`: when a range is made lazy, its pages count as written, so the copies over it read the new bytes (`VICTORY_LAZY_NOTE=0` turns it off);
+    - `VICTORY_LAZY_WATCH` (`cover_lazy`, `open_given`, `lazy_shown_anew`): a lazy page can't be made read-only, so the other views of its physical page are guarded for it, and a write through one of them tells the copies over the lazy address (`=0` turns it off).
+    - `VICTORY_LAZY_STREAM` (`writing`): DirectStorage's streams are announced at every address that shows the pages, the lazy ones too; those now count as written, so a texture there reads its streamed-in bytes. Without it, a face in the opening cutscene showed coloured noise for ~15 s (`=0` turns it off). Small noisy patches can still remain for a moment (seen in one of three runs).
 - **Capture and panel:** F8 pictures (`capture.rs`), the panel above (`fpsbox.rs`, fed by `host.rs` meter lines, `dstorage.rs`, `xmem.rs`), and save logging (`xgamesave.rs`).
 - **DXR groundwork** (`dxr.rs`, `modules/bvh.rs`, `docs/fork-dxr.md`): inert unless `VICTORY_DXR=1`.
 
@@ -117,7 +121,7 @@ G6 traces its own rays: its `XboxBvhBuilder.dll` builds the structures and compu
 
 ## Known open problems (good places to help)
 
-1. Lazy page mappings break geometry: `xmem.rs` `map_alias_lazy` / `lazy_source`, `host.rs` `read` / `write_mapped`.
+1. Lazy page mappings: a lazy page that `xmem.rs` `map_lazy` really maps (the title touched it, or no view showed its page) isn't told to the guards (`watch.rs`), which still take it for an empty placeholder. Never seen in a run so far (`mapped_when_used=0`), but writes through such a page would go unseen.
 2. A magenta stripe in the kitchen shot of the intro; its source pass is unknown. Capture intermediate render targets on that frame.
 3. A few pipelines still build mid-run on a warm cache (panel `SHADERS BUILDING`; about 90 on a third run).
 4. VRAM spill: ~8.6 GB in PC memory in the intro. Try `VICTORY_TEXTURE_BUDGET_MB`.
