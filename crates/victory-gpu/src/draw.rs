@@ -157,7 +157,7 @@ impl TableGroup {
 }
 
 /// A root argument as the title set it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 enum Root {
     #[default]
     None,
@@ -563,6 +563,11 @@ pub(crate) struct State {
     /// The records clamped in a batch, if later executions may still read
     /// them ([`batches`]).
     batch: Option<Batch>,
+    /// What the last bind of this list was given (pipeline, kind, heaps,
+    /// roots) and the list's epoch then, hashed, to count binds that repeat
+    /// the one before ([`BIND_SAME`]).
+    #[cfg(feature = "diagnostics")]
+    last_bind: (u64, u64),
     /// The user data bound last, of the last stage that has some (for the
     /// report of a removed device, `crate::host::indirects`).
     #[cfg(feature = "diagnostics")]
@@ -964,6 +969,13 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "diagnostics")]
 static BIND_PARTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
+/// Since the last frame line: binds; those given the same list, pipeline,
+/// kind, heaps and roots as the bind before them on that list; and of those,
+/// the ones in the same epoch of the list (nothing recorded in between that
+/// changes what is up to date).
+#[cfg(feature = "diagnostics")]
+static BIND_SAME: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 /// Counts a part of [`DrawState::bind`] into [`BIND_PARTS`] when dropped.
 #[cfg(feature = "diagnostics")]
 struct BindTimer(usize, std::time::Instant);
@@ -1056,6 +1068,14 @@ pub(crate) fn bind_line(frames: f64) {
         part(4),
         part(6),
     );
+    let s: Vec<f64> = BIND_SAME.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "binds per frame that repeat the one before on their list: {:.0} of {:.0} given the same pipeline, heaps, tables \
+         and root views (root constants not counted); {:.0} of those in the same epoch of the list",
+        s[1],
+        s[0],
+        s[2],
+    );
     let t: Vec<f64> = TABLE_PARTS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     let tp = |i: usize| format!("{:.2} ms in {:.0}", t[i] / 1e6, t[i + 1]);
     tracing::info!(
@@ -1078,6 +1098,20 @@ pub(crate) fn bind_line(frames: f64) {
         tp(T_SLOT_VIEW),
         tp(T_MAKE_AT),
         tp(T_READABLE),
+    );
+    let l: Vec<f64> = crate::descriptor::host::LISTED_STATS
+        .iter()
+        .map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames)
+        .collect();
+    tracing::info!(
+        "views a list made before, per frame: {:.0} found in the thread's cache, {:.0} made into it ({:.2} ms in {:.0} \
+         make_twinned, all threads); the cache emptied {:.0} times for another recording, holding {:.0} views",
+        l[0],
+        l[1],
+        l[4] / 1e6,
+        l[5],
+        l[2],
+        l[3],
     );
 }
 
@@ -1903,6 +1937,31 @@ impl State {
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         let _whole = BindTimer::new(0);
+        #[cfg(feature = "diagnostics")]
+        {
+            use std::hash::{Hash, Hasher};
+            // What this bind is given, without the list's epoch; and with it.
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (std::ptr::from_ref(list) as usize, self.pipeline, p.pso.as_raw() as usize, compute, self.heaps).hash(&mut h);
+            // Root constants change from draw to draw (s4-bind-same: no bind
+            // repeated the one before with them counted); tables and views:
+            for root in self.roots_ref(compute) {
+                match root {
+                    Root::Constants(_) => 1u8.hash(&mut h),
+                    other => other.hash(&mut h),
+                }
+            }
+            let given = h.finish();
+            let epoch = list.epoch();
+            BIND_SAME[0].fetch_add(1, Ordering::Relaxed);
+            if self.last_bind.0 == given {
+                BIND_SAME[1].fetch_add(1, Ordering::Relaxed);
+                if self.last_bind.1 == epoch {
+                    BIND_SAME[2].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            self.last_bind = (given, epoch);
+        }
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         #[cfg(feature = "diagnostics")]

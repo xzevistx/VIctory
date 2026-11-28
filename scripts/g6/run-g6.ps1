@@ -3,7 +3,7 @@
 # below. Point -GameDir at your own dump of the title; nothing else is needed.
 #
 #   .\scripts\g6\run-g6.ps1 -GameDir 'D:\Games\G6'
-#   .\scripts\g6\run-g6.ps1 -GameDir 'D:\Games\G6' -Exe 'target\diag\victory.exe' -Extra 'VICTORY_LAZY_ALIAS=1'
+#   .\scripts\g6\run-g6.ps1 -GameDir 'D:\Games\G6' -Exe 'target\diag\victory.exe' -Extra 'VICTORY_LAZY_ALIAS=0'
 #
 # -Exe defaults to the diagnostics build (cargo build --profile diag -p victory
 # --features diagnostics). Logs go to <DataRoot>\events.txt. F10 toggles the
@@ -32,7 +32,7 @@ $s = [ordered]@{
     # VICTORY_WAVE_NATIVE=1: the water programs' 64-lane wave code runs as plain 32-lane
     # waves; with 0 their fallback left black and white squares on the sea and in pools
     # (runs fix-t8 against fix-t9, same shots; 18.1 vs 18.4 FPS).
-    VICTORY_WAVE_NATIVE = '1'; VICTORY_LAZY_ALIAS = '0'; VICTORY_HIGH_VIEWS = '0'; VICTORY_UPLOAD_SLOTS_TOP_DOWN = '0'
+    VICTORY_WAVE_NATIVE = '1'; VICTORY_LAZY_ALIAS = '1'; VICTORY_HIGH_VIEWS = '0'; VICTORY_UPLOAD_SLOTS_TOP_DOWN = '0'
     VICTORY_CARD_BUFFERS_FIRST = '0'; VICTORY_MAP_THREADS = '1'; VICTORY_PIPELINE_WAIT_MS = '500'
     # g6-vt3: upstream fa8fc1d keeps NVIDIA pipelines with static samplers out of the
     # pipeline library, so ~418 rebuilt in every loading screen (4.6 FPS for the first

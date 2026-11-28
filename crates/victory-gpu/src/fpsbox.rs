@@ -200,11 +200,31 @@ pub(crate) fn presented() {
     let now = std::time::Instant::now();
     let mut times = TIMES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(last) = times.0.replace(now) {
-        times.1.push_back(now.duration_since(last).as_secs_f32() * 1000.0);
+        let ms = now.duration_since(last).as_secs_f32() * 1000.0;
+        times.1.push_back(ms);
         if times.1.len() > KEPT {
             times.1.pop_front();
         }
+        #[cfg(feature = "diagnostics")]
+        log_frame_time(ms);
     }
+}
+
+/// Diagnostics: each frame's time, said once a second in one line, so that
+/// a run's 1% low can be taken over any stretch of it afterwards (the panel's
+/// is of the last 1,000 frames only). `opt\tools\cpu_breakdown.py` reads it.
+#[cfg(feature = "diagnostics")]
+fn log_frame_time(ms: f32) {
+    static SECOND: Mutex<Vec<f32>> = Mutex::new(Vec::new());
+    let mut second = SECOND.lock().unwrap_or_else(|e| e.into_inner());
+    second.push(ms);
+    if second.iter().sum::<f32>() < 1000.0 {
+        return;
+    }
+    let line = second.iter().map(|ms| format!("{ms:.1}")).collect::<Vec<_>>().join(" ");
+    second.clear();
+    drop(second);
+    tracing::info!("frame times ms: {line}");
 }
 
 /// The 1% low: the frame rate of the mean of the slowest hundredth of

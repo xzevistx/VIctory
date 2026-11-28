@@ -47,8 +47,14 @@ pub(crate) fn on() -> bool {
     // texture in lazy pages came out stale and spread over the surfaces that sample it (runs
     // vt-smear-*: smeared with both on, clean with this off, 12.1 fps and a 1% low of 3.6).
     // (Asked each time: lazy pages are only known once the title's mapper is registered.)
+    // Since lazy pages are watched through the views of their physical pages
+    // (`VICTORY_LAZY_WATCH`, `title_memory_shown_anew`), read-ahead is on with
+    // them too (`VICTORY_AHEAD_WITH_LAZY=0`: off with them, as before). Off, every
+    // texture went the other way, and a face streamed in under its texture kept
+    // the noise it showed first for the whole opening cutscene: lazy on (run
+    // p1-lazy-on) and lazy off with read-ahead off alike (run p3-off-noahead).
     *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_AHEAD").is_some_and(|v| v != "0"))
-        && !crate::watch::lazy_on()
+        && (!crate::watch::lazy_on() || crate::toggled!("VICTORY_AHEAD_WITH_LAZY"))
 }
 
 /// An upload on its way.

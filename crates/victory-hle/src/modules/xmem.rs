@@ -1567,6 +1567,9 @@ fn map_alias_lazy(physical: &Physical, to: usize, from: usize, len: usize) -> bo
     for (i, slice) in slices.iter().enumerate() {
         victory_gpu::title_memory_view(to + i * PAGE, PAGE, slice.section.handle as usize, (slice.index * PAGE) as u64);
     }
+    // No write happened at `to`, so nothing else tells the copies over it
+    // that it shows other bytes now.
+    victory_gpu::title_memory_shown_anew(to, len);
     lazy_stat(0, slices.len() as u64);
     true
 }
