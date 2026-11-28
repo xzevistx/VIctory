@@ -957,6 +957,130 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Inside [`DrawState::bind`], since the last frame line (all threads):
+/// nanoseconds and number of each part, [nanos, count] pairs: the whole
+/// bind (0, 1), textures picked by index (2, 3), descriptor tables (4, 5),
+/// title memory by address (6, 7).
+#[cfg(feature = "diagnostics")]
+static BIND_PARTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Counts a part of [`DrawState::bind`] into [`BIND_PARTS`] when dropped.
+#[cfg(feature = "diagnostics")]
+struct BindTimer(usize, std::time::Instant);
+
+#[cfg(feature = "diagnostics")]
+impl BindTimer {
+    fn new(part: usize) -> Self {
+        BindTimer(part, std::time::Instant::now())
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for BindTimer {
+    fn drop(&mut self) {
+        BIND_PARTS[self.0].fetch_add(self.1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        BIND_PARTS[self.0 + 1].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Inside [`DrawState::tables`], since the last frame line (all threads),
+/// [nanos, count] pairs: deciding which tables are fresh, direct entries,
+/// then per table: skipped, a known table taken as it was, a known table
+/// whose views were looked at again, a table made in dynamic slots; hashing
+/// the tables' records; and the slots hashed, the slots made.
+#[cfg(feature = "diagnostics")]
+static TABLE_PARTS: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
+/// `readable` wherever it is called; `make_at` in tables made; slots of
+/// tables made that copied a view the list made before, and the others.
+#[cfg(feature = "diagnostics")]
+const T_READABLE: usize = 16;
+#[cfg(feature = "diagnostics")]
+const T_MAKE_AT: usize = 18;
+#[cfg(feature = "diagnostics")]
+const T_SLOT_LISTED: usize = 20;
+#[cfg(feature = "diagnostics")]
+const T_SLOT_VIEW: usize = 22;
+#[cfg(feature = "diagnostics")]
+const T_DECIDE: usize = 0;
+#[cfg(feature = "diagnostics")]
+const T_DIRECT: usize = 2;
+#[cfg(feature = "diagnostics")]
+const T_SKIPPED: usize = 4;
+#[cfg(feature = "diagnostics")]
+const T_HIT_ONCE: usize = 6;
+#[cfg(feature = "diagnostics")]
+const T_HIT_AGAIN: usize = 8;
+#[cfg(feature = "diagnostics")]
+const T_MADE: usize = 10;
+#[cfg(feature = "diagnostics")]
+const T_HASH: usize = 12;
+#[cfg(feature = "diagnostics")]
+const T_SLOTS: usize = 14;
+#[cfg(feature = "diagnostics")]
+const T_MADE_SLOTS: usize = 15;
+
+/// Counts a part of [`DrawState::tables`] into [`TABLE_PARTS`] when
+/// dropped, under the part it was last set to.
+#[cfg(feature = "diagnostics")]
+struct TableTimer(std::cell::Cell<usize>, std::time::Instant);
+
+#[cfg(feature = "diagnostics")]
+impl TableTimer {
+    fn new(part: usize) -> Self {
+        TableTimer(std::cell::Cell::new(part), std::time::Instant::now())
+    }
+
+    fn set(&self, part: usize) {
+        self.0.set(part);
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for TableTimer {
+    fn drop(&mut self) {
+        let part = self.0.get();
+        TABLE_PARTS[part].fetch_add(self.1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        TABLE_PARTS[part + 1].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The parts of the binds, per frame, for the frame-rate lines.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn bind_line(frames: f64) {
+    let b: Vec<f64> = BIND_PARTS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let part = |i: usize| format!("{:.2} ms in {:.0}", b[i] / 1e6, b[i + 1]);
+    tracing::info!(
+        "binds per frame, all threads: whole {}; of it textures picked by index {}, descriptor tables {}, title memory by address {}",
+        part(0),
+        part(2),
+        part(4),
+        part(6),
+    );
+    let t: Vec<f64> = TABLE_PARTS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let tp = |i: usize| format!("{:.2} ms in {:.0}", t[i] / 1e6, t[i + 1]);
+    tracing::info!(
+        "descriptor tables per frame, all threads: deciding {}, direct entries {}; tables skipped {}, known and taken as they were {}, \
+         known and looked at again {}, made in dynamic slots {} ({:.0} slots); hashing {} ({:.0} slots)",
+        tp(T_DECIDE),
+        tp(T_DIRECT),
+        tp(T_SKIPPED),
+        tp(T_HIT_ONCE),
+        tp(T_HIT_AGAIN),
+        tp(T_MADE),
+        t[T_MADE_SLOTS],
+        tp(T_HASH),
+        t[T_SLOTS],
+    );
+    tracing::info!(
+        "descriptor slots per frame, all threads: of tables made, slots copied from a view the list made before {}, the others {} \
+         (making views {}); readable() everywhere {}",
+        tp(T_SLOT_LISTED),
+        tp(T_SLOT_VIEW),
+        tp(T_MAKE_AT),
+        tp(T_READABLE),
+    );
+}
+
 /// `n` consecutive dynamic slots of `host` ([`crate::descriptor::host::HostHeap::dynamic`]).
 /// With none free, the flights in the air are landed first, which gives
 /// back the slots of their lists, and the slots are asked for again.
@@ -1777,9 +1901,15 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        let _whole = BindTimer::new(0);
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
+        #[cfg(feature = "diagnostics")]
+        let early = BindTimer::new(2);
         self.early_textures(list, p, compute);
+        #[cfg(feature = "diagnostics")]
+        drop(early);
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -1868,7 +1998,11 @@ impl State {
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
+            #[cfg(feature = "diagnostics")]
+            let tabled = BindTimer::new(4);
             let made = self.tables(list, &t.tables, compute);
+            #[cfg(feature = "diagnostics")]
+            drop(tabled);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -1891,7 +2025,12 @@ impl State {
                 } else {
                     crate::memory::Use::Reads
                 };
-                let Some(ready) = self.memory_ready(list, t, compute, use_) else {
+                #[cfg(feature = "diagnostics")]
+                let readied = BindTimer::new(6);
+                let ready = self.memory_ready(list, t, compute, use_);
+                #[cfg(feature = "diagnostics")]
+                drop(readied);
+                let Some(ready) = ready else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return prepare_failed!(self, ShaderMemoryViews);
                 };
@@ -4047,6 +4186,8 @@ impl State {
     ) -> Few<(u8, u32), 16> {
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
+        #[cfg(feature = "diagnostics")]
+        let deciding = TableTimer::new(T_DECIDE);
         for group in &plan.groups {
             let slot = group.slot;
             let needs_snapshot = group.has_cbv
@@ -4061,14 +4202,22 @@ impl State {
                 fresh[usize::from(slot / 64)] |= 1u64 << (slot % 64);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        drop(deciding);
+        #[cfg(feature = "diagnostics")]
+        let direct = TableTimer::new(T_DIRECT);
         for &(g, e) in &plan.direct {
             let group = &plan.groups[g];
             if !selected_slot(&fresh, group.slot) {
                 self.table_entry(list, &group.entries[e], compute);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        drop(direct);
         let mut made = Few::default();
         for group in &plan.groups {
+            #[cfg(feature = "diagnostics")]
+            let path = TableTimer::new(T_SKIPPED);
             let slot = group.slot;
             if !selected_slot(&fresh, slot) {
                 continue;
@@ -4111,6 +4260,8 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
+            #[cfg(feature = "diagnostics")]
+            let hashing = TableTimer::new(T_HASH);
             let key = {
                 let mut h = RecordHash::default();
                 for k in 0..n {
@@ -4120,6 +4271,11 @@ impl State {
                 }
                 (table, n, h.0)
             };
+            #[cfg(feature = "diagnostics")]
+            {
+                drop(hashing);
+                TABLE_PARTS[T_SLOTS].fetch_add(u64::from(n), Ordering::Relaxed);
+            }
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
             if let Some(known) = self.fresh_tables.get_mut(&key) {
@@ -4134,9 +4290,13 @@ impl State {
                     if *depth {
                         TESTED_DEPTH.set((reader.3, true));
                     }
+                    #[cfg(feature = "diagnostics")]
+                    path.set(T_HIT_ONCE);
                     made.push((slot, first * 32));
                     continue;
                 }
+                #[cfg(feature = "diagnostics")]
+                path.set(T_HIT_AGAIN);
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
@@ -4173,6 +4333,11 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
+            #[cfg(feature = "diagnostics")]
+            {
+                path.set(T_MADE);
+                TABLE_PARTS[T_MADE_SLOTS].fetch_add(u64::from(n), Ordering::Relaxed);
+            }
             let Some(first) = dynamic_or_settle(host, n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
@@ -4202,6 +4367,8 @@ impl State {
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
+                #[cfg(feature = "diagnostics")]
+                let slot_path = TableTimer::new(T_SLOT_VIEW);
                 let index = first + k;
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
@@ -4209,6 +4376,8 @@ impl State {
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
                     && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
+                    #[cfg(feature = "diagnostics")]
+                    slot_path.set(T_SLOT_LISTED);
                     let kind = group
                         .entry(k)
                         .map(|u| u.kind)
@@ -4284,7 +4453,11 @@ impl State {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         let (_, deferred) = crate::residency::upload_deferred_during(|| {
+                            #[cfg(feature = "diagnostics")]
+                            let making = TableTimer::new(T_MAKE_AT);
                             host.make_at(index, &view);
+                            #[cfg(feature = "diagnostics")]
+                            drop(making);
                             if let Some(kind) = kind {
                                 readable(list, kind, &view);
                             }
@@ -5110,6 +5283,12 @@ impl RecordHash {
 }
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
+    #[cfg(feature = "diagnostics")]
+    let _timed = TableTimer::new(T_READABLE);
+    readable_inner(list, kind, view);
+}
+
+fn readable_inner(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);

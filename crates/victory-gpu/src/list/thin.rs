@@ -365,6 +365,23 @@ pub(crate) fn line(frames: f64) {
         CHUNKS.swap(0, Relaxed) as f64 / frames,
         s[3]
     );
+    #[cfg(feature = "diagnostics")]
+    {
+        let mut ops: Vec<(u64, f64, f64)> = (0..BY_OP.len() as u64)
+            .map(|op| {
+                let [calls, nanos] = &BY_OP[op as usize];
+                (op, calls.swap(0, Relaxed) as f64 / frames, nanos.swap(0, Relaxed) as f64 / 1e6 / frames)
+            })
+            .filter(|o| o.1 > 0.0)
+            .collect();
+        ops.sort_by(|a, b| b.2.total_cmp(&a.2));
+        let list: Vec<String> = ops
+            .iter()
+            .map(|(op, calls, ms)| format!("{} {:.0} calls {:.2} ms ({:.1} us each)", op_name(*op), calls, ms, ms * 1e3 / calls))
+            .collect();
+        tracing::info!("list calls translated per frame by kind, all threads: {}", list.join("; "));
+        crate::draw::bind_line(frames);
+    }
 }
 
 #[inline]
@@ -434,6 +451,14 @@ macro_rules! plain {
         $(extern "system" fn $name(this: This $(, $a: $t)*) {
             front(this).put(Plain::$op as u64, &[$(Word::word($a)),*]);
         })*
+        /// The name of `op`, if it is one of them.
+        #[cfg(feature = "diagnostics")]
+        fn plain_name(op: u64) -> Option<&'static str> {
+            match op {
+                $(n if n == Plain::$op as u64 => Some(stringify!($op)),)*
+                _ => None,
+            }
+        }
         /// Whether `op` was one of them; done on `list`.
         #[inline]
         fn run_plain(op: u64, list: This, w: &[u64]) -> bool {
@@ -509,6 +534,58 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+
+/// Since the last frame line, by op: calls translated and their nanoseconds
+/// (all threads).
+#[cfg(feature = "diagnostics")]
+static BY_OP: [[std::sync::atomic::AtomicU64; 2]; 64] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 64];
+
+/// Counts one translated call of an op into [`BY_OP`] when dropped.
+#[cfg(feature = "diagnostics")]
+struct OpTimer(u64, std::time::Instant);
+
+#[cfg(feature = "diagnostics")]
+impl OpTimer {
+    fn new(op: u64) -> Self {
+        OpTimer(op, std::time::Instant::now())
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for OpTimer {
+    fn drop(&mut self) {
+        if let Some([calls, nanos]) = BY_OP.get(self.0 as usize) {
+            calls.fetch_add(1, Relaxed);
+            nanos.fetch_add(self.1.elapsed().as_nanos() as u64, Relaxed);
+        }
+    }
+}
+
+/// The name of `op`, for [`BY_OP`]'s line.
+#[cfg(feature = "diagnostics")]
+fn op_name(op: u64) -> &'static str {
+    const OTHERS: [&str; 17] = [
+        "RESET",
+        "CLOSE",
+        "UPLOAD",
+        "BARRIER",
+        "BARRIER_GROUPS",
+        "VIEWPORTS",
+        "SCISSORS",
+        "BLEND_FACTOR",
+        "HEAPS",
+        "COMPUTE_CONSTANTS",
+        "GRAPHICS_CONSTANTS",
+        "INDEX_BUFFER",
+        "VERTEX_BUFFERS",
+        "TARGETS",
+        "CLEAR_RTV",
+        "CLEAR_DSV",
+        "COPY_TEXTURE",
+    ];
+    plain_name(op).or_else(|| op.checked_sub(after(0)).and_then(|i| OTHERS.get(i as usize).copied())).unwrap_or("?")
+}
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -745,6 +822,8 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         if skip && op != CLOSE && op != RESET {
             continue;
         }
+        #[cfg(feature = "diagnostics")]
+        let _timed = OpTimer::new(op);
         if run_plain(op, list, w) {
             continue;
         }
