@@ -83,6 +83,7 @@ You need your own legal dump of the title. No game files are in this repository.
   - It used to lose the prison room's walls and the character's body. Two fixes in `watch.rs` make it draw right:
     - `title_memory_shown_anew`: when a range is made lazy, its pages count as written, so the copies over it read the new bytes (`VICTORY_LAZY_NOTE=0` turns it off);
     - `VICTORY_LAZY_WATCH` (`cover_lazy`, `open_given`, `lazy_shown_anew`): a lazy page can't be made read-only, so the other views of its physical page are guarded for it, and a write through one of them tells the copies over the lazy address (`=0` turns it off).
+    - `VICTORY_LAZY_STREAM` (`writing`): DirectStorage's streams are announced at every address that shows the pages, the lazy ones too; those now count as written, so a texture there reads its streamed-in bytes. Without it, a face in the opening cutscene showed coloured noise for ~15 s (`=0` turns it off). Small noisy patches can still remain for a moment (seen in one of three runs).
 - **Capture and panel:** F8 pictures (`capture.rs`), the panel above (`fpsbox.rs`, fed by `host.rs` meter lines, `dstorage.rs`, `xmem.rs`), and save logging (`xgamesave.rs`).
 - **DXR groundwork** (`dxr.rs`, `modules/bvh.rs`, `docs/fork-dxr.md`): inert unless `VICTORY_DXR=1`.
 

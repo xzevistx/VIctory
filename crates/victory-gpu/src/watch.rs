@@ -3511,6 +3511,15 @@ pub fn writing(at: usize, len: usize) {
         }
         let _ = opened;
     }
+    // A lazy page under it ([`lazy_watch`]): nothing is mapped there to be
+    // opened, and it was told as never written. DirectStorage's streams into
+    // the page's physical memory come here for every address that shows it
+    // (`xmem::pages_written`), once more when the bytes are in: told as
+    // written at its next asking, the copies over it (a face's texture) read
+    // them. `VICTORY_LAZY_STREAM=0`: not, as before.
+    if len != 0 && lazy_watch() && crate::toggled!("VICTORY_LAZY_STREAM") {
+        lazy_shown_anew(&[(at, len)]);
+    }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
